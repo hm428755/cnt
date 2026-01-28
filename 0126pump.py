@@ -24,10 +24,10 @@ except ImportError:
 # ============================================================
 
 # --- 통신 설정 ---
-PUMP1_PORT = 'COM4'      # 펌프1 포트 (장치관리자에서 확인)
-PUMP1_ID = 2             # 펌프1 Slave ID
-PUMP2_PORT = 'COM5'      # 펌프2 포트
-PUMP2_ID = 3             # 펌프2 Slave ID
+PUMP1_PORT = 'COM3'      # 펌프1 포트 (장치관리자에서 확인)
+PUMP1_ID = 2             # 펌프1 Slave ID #주입용
+PUMP2_PORT = 'COM3'      # 펌프2 포트
+PUMP2_ID = 3             # 펌프2 Slave ID #순환용
 BAUDRATE = 9600          # 통신 속도 (9600 기본)
 
 # --- 펌프2: 연속 순환 설정 ---
@@ -267,4 +267,5 @@ if __name__ == "__main__":
     main_process()
     
     # 또는 테스트만 하려면 위를 주석처리하고 아래 실행
+
     # test_pump()
