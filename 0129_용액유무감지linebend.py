@@ -1,9 +1,12 @@
 """
-젤 흡수 감지 (Line Bend 방식)
+젤 흡수 감지 - 통합 자동화
 
-감지 방법:
-- 투명 용액: Line Bend (패턴 꺾임 정도)
-- CNT 용액: 밝기 변화 (검정→흰색)
+흐름:
+1. 투명 용액 흡수 대기 (Line Bend)
+2. CNT 넣으세요 → 자동 감지
+3. CNT 흡수 대기 (밝기)
+4. 투명 넣으세요 → 자동 감지
+5. 반복...
 
 설치: pip install opencv-python numpy
 """
@@ -13,26 +16,31 @@ import numpy as np
 import time
 import json
 import os
+import winsound  # 윈도우 알림음
 
 
 # ============================================================
 #                    [설정] - 여기만 수정하세요!
 # ============================================================
 
-CAMERA_INDEX = 1              # 카메라 번호 (USB 카메라)
-ROI_FILE = 'roi_settings.json'
+CAMERA_INDEX = 1              # 카메라 번호
 
 # 플리커 제거
 ANTI_FLICKER = True
 FRAME_AVG_COUNT = 5
 
-# --- 투명 용액 감지용 (Line Bend 기준) ---
-LINE_BEND_THRESHOLD = 20      # 이 값 이상 = 용액 있음, 이하 = 흡수 완료
+# --- 투명 용액 감지 (Line Bend) ---
+LINE_BEND_THRESHOLD = 20      # 이하 = 흡수 완료
 
-# --- CNT 감지용 (밝기 기준) ---
-CNT_THRESHOLD = 87            # 이 값 이상 = CNT 흡수 완료
+# --- CNT 감지 (밝기) ---
+CNT_THRESHOLD = 87            # 이상 = 흡수 완료
 
+# --- 파일 ---
+ROI_FILE = 'roi_settings.json'
+
+# --- 타이밍 ---
 CHECK_INTERVAL = 0.5          # 체크 간격 (초)
+STABLE_COUNT = 3              # 연속 N번 감지되면 확정
 
 # ============================================================
 #                    [설정 끝]
@@ -79,7 +87,6 @@ def init_camera():
         return None
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    print(f"✅ 카메라 연결됨")
     return cap
 
 
@@ -101,12 +108,10 @@ def read_frame(cap):
 
 
 def get_brightness(gray):
-    """평균 밝기"""
     return gray.mean()
 
 
 def get_line_bend(gray):
-    """패턴 꺾임 정도 (밝은 픽셀 Y좌표 표준편차)"""
     threshold = gray.mean() + 30
     bright_mask = gray > threshold
     
@@ -129,8 +134,16 @@ def get_line_bend(gray):
     return np.std(y_means)
 
 
+def beep_alert():
+    """알림음"""
+    try:
+        winsound.Beep(1000, 500)  # 1000Hz, 0.5초
+    except:
+        print("\a")  # 기본 비프음
+
+
 def select_roi():
-    """ROI 영역 선택"""
+    """ROI 설정"""
     global roi_rect
     print("\n" + "="*50)
     print("  ROI 설정")
@@ -220,6 +233,20 @@ def live_view():
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             cv2.putText(display, f"Brightness: {brightness:.1f}", (10, 60),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # 상태 표시
+            if line_bend > LINE_BEND_THRESHOLD:
+                status = "투명 용액 있음"
+                color = (0, 255, 255)
+            elif brightness < CNT_THRESHOLD:
+                status = "CNT 있음"
+                color = (0, 0, 255)
+            else:
+                status = "비어있음 (젤만)"
+                color = (0, 255, 0)
+            
+            cv2.putText(display, f"Status: {status}", (10, 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         cv2.imshow("Live View", display)
         
@@ -234,14 +261,16 @@ def calibrate():
     """캘리브레이션"""
     print("\n" + "="*50)
     print("  캘리브레이션")
-    print("  [1] = 용액 있음 + 패턴")
-    print("  [2] = 용액 없음 + 패턴")
+    print("  [1] = 용액 있음 (투명)")
+    print("  [2] = 용액 없음 (빈 상태)")
+    print("  [3] = CNT 있음")
+    print("  [4] = CNT 흡수 후 (젤만)")
     print("  [Q] = 종료")
     print("="*50)
     
     roi = load_roi()
     if not roi:
-        print("❌ ROI 없음! 먼저 1번으로 설정하세요")
+        print("❌ ROI 없음!")
         return
     
     cap = init_camera()
@@ -250,8 +279,7 @@ def calibrate():
     
     x1, y1, x2, y2 = roi
     
-    liquid_bend = None
-    no_liquid_bend = None
+    vals = {}
     
     while True:
         ret, frame = read_frame(cap)
@@ -273,50 +301,210 @@ def calibrate():
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
         y_pos = 100
-        if liquid_bend is not None:
-            cv2.putText(display, f"[1] Liquid: {liquid_bend:.1f}", (10, y_pos),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-            y_pos += 25
-        if no_liquid_bend is not None:
-            cv2.putText(display, f"[2] No Liquid: {no_liquid_bend:.1f}", (10, y_pos),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        
-        cv2.putText(display, "[1]=Liquid [2]=NoLiquid [Q]=Quit",
-                   (10, display.shape[0]-10),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        for key, val in vals.items():
+            cv2.putText(display, f"[{key}] {val}", (10, y_pos),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            y_pos += 20
         
         cv2.imshow("Calibration", display)
         
         key = cv2.waitKey(1) & 0xFF
         
         if key == ord('1'):
-            liquid_bend = line_bend
-            print(f"\n✅ [1] 용액 있음: Line Bend = {liquid_bend:.1f}")
-        
+            vals['1'] = f"투명 있음: Bend={line_bend:.1f}"
+            print(f"✅ [1] 투명 있음: Line Bend = {line_bend:.1f}")
         elif key == ord('2'):
-            no_liquid_bend = line_bend
-            print(f"\n✅ [2] 용액 없음: Line Bend = {no_liquid_bend:.1f}")
-            
-            if liquid_bend is not None:
-                threshold = (liquid_bend + no_liquid_bend) / 2
-                print(f"\n" + "="*40)
-                print(f"  [추천 설정값]")
-                print(f"  LINE_BEND_THRESHOLD = {threshold:.0f}")
-                print(f"="*40)
-        
+            vals['2'] = f"빈 상태: Bend={line_bend:.1f}"
+            print(f"✅ [2] 빈 상태: Line Bend = {line_bend:.1f}")
+        elif key == ord('3'):
+            vals['3'] = f"CNT 있음: Bright={brightness:.1f}"
+            print(f"✅ [3] CNT 있음: Brightness = {brightness:.1f}")
+        elif key == ord('4'):
+            vals['4'] = f"CNT 후: Bright={brightness:.1f}"
+            print(f"✅ [4] CNT 후: Brightness = {brightness:.1f}")
         elif key == ord('q'):
             break
     
     cap.release()
     cv2.destroyAllWindows()
+    
+    print("\n" + "="*40)
+    print("  코드 상단 [설정]에 입력하세요!")
+    print("="*40)
+
+
+def full_cycle_test():
+    """전체 사이클 테스트"""
+    print("\n" + "="*50)
+    print("  🔄 전체 사이클 테스트")
+    print("="*50)
+    print("""
+  [흐름]
+    1. "투명 넣으세요" → 넣음 감지 → "확인!"
+    2. 투명 흡수 대기 → "흡수 완료!"
+    3. "CNT 넣으세요" → 넣음 감지 → "확인!"
+    4. CNT 흡수 대기 → "흡수 완료!"
+    5. 반복...
+
+  [Q] = 종료 (영상 창에서)
+""")
+    
+    roi = load_roi()
+    if not roi:
+        print("❌ ROI 없음!")
+        return
+    
+    cap = init_camera()
+    if not cap:
+        return
+    
+    x1, y1, x2, y2 = roi
+    
+    # 상태:
+    # 'wait_transparent_add' = 투명 넣기 대기
+    # 'wait_transparent_absorb' = 투명 흡수 대기
+    # 'wait_cnt_add' = CNT 넣기 대기
+    # 'wait_cnt_absorb' = CNT 흡수 대기
+    
+    state = 'wait_transparent_add'
+    stable_counter = 0
+    cycle_count = 0
+    
+    print("\n🚀 시작! 투명 용액을 넣으세요...")
+    
+    while True:
+        ret, frame = read_frame(cap)
+        if not ret:
+            break
+        
+        roi_frame = frame[y1:y2, x1:x2]
+        gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+        
+        line_bend = get_line_bend(gray)
+        brightness = get_brightness(gray)
+        
+        display = frame.copy()
+        
+        # ============================================
+        # 상태 1: 투명 용액 넣기 대기
+        # ============================================
+        if state == 'wait_transparent_add':
+            # Line Bend 증가 = 투명 용액 넣음
+            if line_bend > LINE_BEND_THRESHOLD:
+                stable_counter += 1
+            else:
+                stable_counter = 0
+            
+            if stable_counter >= STABLE_COUNT:
+                beep_alert()
+                print(f"\n✅ 투명 용액 확인!")
+                print(f"⏳ 흡수 대기 중...")
+                state = 'wait_transparent_absorb'
+                stable_counter = 0
+            
+            status = f"[투명 넣기 대기] Line Bend: {line_bend:.1f}"
+            color = (255, 255, 0)  # 시안
+            instruction = ">>> 투명 용액을 넣으세요! <<<"
+        
+        # ============================================
+        # 상태 2: 투명 용액 흡수 대기
+        # ============================================
+        elif state == 'wait_transparent_absorb':
+            # Line Bend 감소 = 흡수 완료
+            if line_bend < LINE_BEND_THRESHOLD:
+                stable_counter += 1
+            else:
+                stable_counter = 0
+            
+            if stable_counter >= STABLE_COUNT:
+                beep_alert()
+                print(f"\n✅ 투명 용액 흡수 완료!")
+                print(f"🔔 CNT를 넣으세요!")
+                state = 'wait_cnt_add'
+                stable_counter = 0
+                cycle_count += 1
+            
+            status = f"[투명 흡수 중] Line Bend: {line_bend:.1f}"
+            color = (0, 255, 255)  # 노랑
+            instruction = "투명 용액 흡수 중..."
+        
+        # ============================================
+        # 상태 3: CNT 넣기 대기
+        # ============================================
+        elif state == 'wait_cnt_add':
+            # 밝기 감소 = CNT 넣음
+            if brightness < CNT_THRESHOLD:
+                stable_counter += 1
+            else:
+                stable_counter = 0
+            
+            if stable_counter >= STABLE_COUNT:
+                beep_alert()
+                print(f"\n✅ CNT 확인!")
+                print(f"⏳ 흡수 대기 중...")
+                state = 'wait_cnt_absorb'
+                stable_counter = 0
+            
+            status = f"[CNT 넣기 대기] Brightness: {brightness:.1f}"
+            color = (0, 165, 255)  # 주황
+            instruction = ">>> CNT를 넣으세요! <<<"
+        
+        # ============================================
+        # 상태 4: CNT 흡수 대기
+        # ============================================
+        elif state == 'wait_cnt_absorb':
+            # 밝기 증가 = 흡수 완료
+            if brightness > CNT_THRESHOLD:
+                stable_counter += 1
+            else:
+                stable_counter = 0
+            
+            if stable_counter >= STABLE_COUNT:
+                beep_alert()
+                print(f"\n✅ CNT 흡수 완료!")
+                print(f"🔔 투명 용액을 넣으세요!")
+                state = 'wait_transparent_add'
+                stable_counter = 0
+            
+            status = f"[CNT 흡수 중] Brightness: {brightness:.1f}"
+            color = (0, 0, 255)  # 빨강
+            instruction = "CNT 흡수 중..."
+        
+        # 화면 표시
+        cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+        
+        cv2.putText(display, status, (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.putText(display, instruction, (10, 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(display, f"Cycle: {cycle_count}", (10, 90),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(display, f"Stable: {stable_counter}/{STABLE_COUNT}", (10, 120),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        
+        # 값 표시
+        cv2.putText(display, f"Line Bend: {line_bend:.1f}", (10, display.shape[0]-50),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        cv2.putText(display, f"Brightness: {brightness:.1f}", (10, display.shape[0]-30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(display, "Q=Quit", (10, display.shape[0]-10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        
+        cv2.imshow("Full Cycle Test", display)
+        
+        if cv2.waitKey(int(CHECK_INTERVAL * 1000)) & 0xFF == ord('q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    print(f"\n종료! 총 {cycle_count} 사이클 완료")
 
 
 def monitor_transparent():
-    """투명 용액 흡수 모니터링"""
+    """투명 용액만 모니터링"""
     print("\n" + "="*50)
-    print("  투명 용액 흡수 모니터링")
-    print(f"  Line Bend > {LINE_BEND_THRESHOLD} = 용액 있음")
-    print(f"  Line Bend < {LINE_BEND_THRESHOLD} = 흡수 완료!")
+    print("  투명 용액 모니터링")
     print("  Q=종료")
     print("="*50)
     
@@ -330,7 +518,6 @@ def monitor_transparent():
         return
     
     x1, y1, x2, y2 = roi
-    absorbed = False
     
     while True:
         ret, frame = read_frame(cap)
@@ -339,29 +526,21 @@ def monitor_transparent():
         
         roi_frame = frame[y1:y2, x1:x2]
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
-        
         line_bend = get_line_bend(gray)
         
         if line_bend < LINE_BEND_THRESHOLD:
             status = "✅ 흡수 완료!"
             color = (0, 255, 0)
-            if not absorbed:
-                absorbed = True
-                print(f"\n🎉 투명 용액 흡수 완료! (Line Bend: {line_bend:.1f})")
         else:
             status = "💧 용액 있음"
             color = (0, 255, 255)
-            absorbed = False
         
         display = frame.copy()
         cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
-        
         cv2.putText(display, f"Line Bend: {line_bend:.1f}", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         cv2.putText(display, status, (10, 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        cv2.putText(display, f"Threshold: {LINE_BEND_THRESHOLD}", (10, 90),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         cv2.imshow("Transparent Monitor", display)
         
@@ -373,10 +552,9 @@ def monitor_transparent():
 
 
 def monitor_cnt():
-    """CNT 용액 흡수 모니터링"""
+    """CNT만 모니터링"""
     print("\n" + "="*50)
-    print("  CNT 용액 흡수 모니터링")
-    print(f"  밝기 > {CNT_THRESHOLD} = 흡수 완료!")
+    print("  CNT 모니터링")
     print("  Q=종료")
     print("="*50)
     
@@ -390,7 +568,6 @@ def monitor_cnt():
         return
     
     x1, y1, x2, y2 = roi
-    absorbed = False
     
     while True:
         ret, frame = read_frame(cap)
@@ -399,23 +576,17 @@ def monitor_cnt():
         
         roi_frame = frame[y1:y2, x1:x2]
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
-        
         brightness = get_brightness(gray)
         
         if brightness > CNT_THRESHOLD:
             status = "✅ CNT 흡수 완료!"
             color = (0, 255, 0)
-            if not absorbed:
-                absorbed = True
-                print(f"\n🎉 CNT 흡수 완료! (밝기: {brightness:.1f})")
         else:
             status = "⚫ CNT 있음"
             color = (0, 0, 255)
-            absorbed = False
         
         display = frame.copy()
         cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
-        
         cv2.putText(display, f"Brightness: {brightness:.1f}", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         cv2.putText(display, status, (10, 60),
@@ -430,11 +601,14 @@ def monitor_cnt():
     cv2.destroyAllWindows()
 
 
-def wait_for_transparent(timeout=300):
-    """투명 용액 흡수 대기 (자동화용)"""
+# ============================================================
+#                    자동화용 함수
+# ============================================================
+
+def wait_for_transparent_absorbed(timeout=300):
+    """투명 용액 흡수 완료 대기 (자동화용)"""
     roi = load_roi()
     if not roi:
-        print("❌ ROI 없음!")
         return False
     
     cap = init_camera()
@@ -442,8 +616,9 @@ def wait_for_transparent(timeout=300):
         return False
     
     x1, y1, x2, y2 = roi
+    stable_counter = 0
     
-    print("⏳ 투명 용액 흡수 대기 중...")
+    print("⏳ 투명 용액 흡수 대기...")
     start_time = time.time()
     
     while time.time() - start_time < timeout:
@@ -455,26 +630,31 @@ def wait_for_transparent(timeout=300):
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
         line_bend = get_line_bend(gray)
         
-        elapsed = time.time() - start_time
-        print(f"\r   경과: {elapsed:.0f}초 | Line Bend: {line_bend:.1f}    ", end='', flush=True)
-        
         if line_bend < LINE_BEND_THRESHOLD:
-            print(f"\n✅ 투명 용액 흡수 완료! ({elapsed:.0f}초)")
+            stable_counter += 1
+        else:
+            stable_counter = 0
+        
+        elapsed = time.time() - start_time
+        print(f"\r   경과: {elapsed:.0f}초 | Line Bend: {line_bend:.1f} | Stable: {stable_counter}/{STABLE_COUNT}    ", 
+              end='', flush=True)
+        
+        if stable_counter >= STABLE_COUNT:
+            print(f"\n✅ 투명 용액 흡수 완료!")
             cap.release()
             return True
         
         time.sleep(CHECK_INTERVAL)
     
-    print(f"\n⚠️ 타임아웃 ({timeout}초)")
+    print(f"\n⚠️ 타임아웃")
     cap.release()
     return False
 
 
-def wait_for_cnt(timeout=300):
-    """CNT 흡수 대기 (자동화용)"""
+def wait_for_cnt_absorbed(timeout=300):
+    """CNT 흡수 완료 대기 (자동화용)"""
     roi = load_roi()
     if not roi:
-        print("❌ ROI 없음!")
         return False
     
     cap = init_camera()
@@ -482,8 +662,9 @@ def wait_for_cnt(timeout=300):
         return False
     
     x1, y1, x2, y2 = roi
+    stable_counter = 0
     
-    print("⏳ CNT 흡수 대기 중...")
+    print("⏳ CNT 흡수 대기...")
     start_time = time.time()
     
     while time.time() - start_time < timeout:
@@ -495,17 +676,23 @@ def wait_for_cnt(timeout=300):
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
         brightness = get_brightness(gray)
         
-        elapsed = time.time() - start_time
-        print(f"\r   경과: {elapsed:.0f}초 | 밝기: {brightness:.1f}    ", end='', flush=True)
-        
         if brightness > CNT_THRESHOLD:
-            print(f"\n✅ CNT 흡수 완료! ({elapsed:.0f}초)")
+            stable_counter += 1
+        else:
+            stable_counter = 0
+        
+        elapsed = time.time() - start_time
+        print(f"\r   경과: {elapsed:.0f}초 | Brightness: {brightness:.1f} | Stable: {stable_counter}/{STABLE_COUNT}    ", 
+              end='', flush=True)
+        
+        if stable_counter >= STABLE_COUNT:
+            print(f"\n✅ CNT 흡수 완료!")
             cap.release()
             return True
         
         time.sleep(CHECK_INTERVAL)
     
-    print(f"\n⚠️ 타임아웃 ({timeout}초)")
+    print(f"\n⚠️ 타임아웃")
     cap.release()
     return False
 
@@ -517,26 +704,26 @@ def wait_for_cnt(timeout=300):
 def main():
     while True:
         print("\n" + "="*50)
-        print("  젤 흡수 감지 (Line Bend)")
-        print("  투명 = 패턴 꺾임 | CNT = 밝기")
+        print("  🧪 젤 흡수 감지 - 통합")
         print("="*50)
         
         roi = load_roi()
         print(f"  ROI: {roi if roi else '❌ 없음'}")
+        print(f"  LINE_BEND_THRESHOLD: {LINE_BEND_THRESHOLD}")
+        print(f"  CNT_THRESHOLD: {CNT_THRESHOLD}")
         
-        print(f"""
+        print("""
   [설정]
     1. ROI 설정
     2. 실시간 영상
     3. 캘리브레이션
 
-  [모니터링]
+  [개별 테스트]
     4. 투명 용액 모니터링
     5. CNT 모니터링
 
-  [자동화 테스트]
-    6. 투명 용액 흡수 대기
-    7. CNT 흡수 대기
+  [통합 테스트] ⭐
+    6. 전체 사이클 테스트
 
     q. 종료
 """)
@@ -554,9 +741,7 @@ def main():
         elif choice == '5':
             monitor_cnt()
         elif choice == '6':
-            wait_for_transparent(timeout=120)
-        elif choice == '7':
-            wait_for_cnt(timeout=120)
+            full_cycle_test()
         elif choice == 'q':
             print("종료")
             break
