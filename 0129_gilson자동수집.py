@@ -92,7 +92,7 @@ def get_uv_classification():
     TODO: 이미 만들어놓은 UV-Vis 분류 코드와 연동
     
     Returns:
-        str: "금속", "반도체", "혼합", "TRASH" 중 하나
+        str: "금속", "반도체", "폐기" 중 하나
     """
     # ============================================
     # TODO: 여기에 UV-Vis 분류 코드 연동
@@ -107,20 +107,18 @@ def get_uv_classification():
     print("[UV-Vis 분류 결과 입력]")
     print("  1 = 금속")
     print("  2 = 반도체") 
-    print("  3 = 혼합")
-    print("  4 = TRASH")
+    print("  3 = 폐기")
     print("="*40)
     
-    choice = input("분류 결과 (1-4): ").strip()
+    choice = input("분류 결과 (1-3): ").strip()
     
     mapping = {
         '1': '금속',
         '2': '반도체',
-        '3': '혼합',
-        '4': 'TRASH'
+        '3': '폐기'
     }
     
-    return mapping.get(choice, 'TRASH')
+    return mapping.get(choice, '폐기')
 
 
 # ============================================================
@@ -205,9 +203,9 @@ def main():
                 gilson.move_to_xy(pos['x'], pos['y'])
                 print(f"   → 이동 완료: ({pos['x']}, {pos['y']}) mm")
             else:
-                print(f"   ⚠️ '{classification}' 위치 없음 → TRASH로 이동")
-                if 'TRASH' in positions:
-                    pos = positions['TRASH']
+                print(f"   ⚠️ '{classification}' 위치 없음 → 폐기로 이동")
+                if '폐기' in positions:
+                    pos = positions['폐기']
                     gilson.move_to_xy(pos['x'], pos['y'])
             
             # ----- Step 4: 수집 완료 -----
