@@ -29,11 +29,22 @@ CAMERA_INDEX = 1              # 카메라 번호
 ANTI_FLICKER = True
 FRAME_AVG_COUNT = 5
 
-# --- 투명 용액 감지 (Line Bend) ---
-LINE_BEND_THRESHOLD = 20      # 이하 = 흡수 완료
+# --- 투명 용액 감지 (Line Bend + 선명도, 판별은 Sharpness만) ---
+# [캘리브레이션] 용액 있을 때 = Sharpness 더 낮음. 빈 컬럼 = Sharpness 더 높음.
+LINE_BEND_THRESHOLD = 20      # (참고용 표시만, 판별 미사용)
+LINE_BEND_LOW = 20
+LINE_BEND_HIGH = 25
+LINE_BEND_RANGE_SCALE = 2
+LINE_BEND_SMOOTH_ALPHA = 0.8
 
-# --- CNT 감지 (밝기) ---
-CNT_THRESHOLD = 87            # 이상 = 흡수 완료
+# 선명도. 용액 있음 = 낮음, 빈 컬럼(흡수 완료) = 높음. 캘리브레이션으로 조정.
+SHARPNESS_LOW = 160           # 이하 = 용액 있음 확정
+SHARPNESS_HIGH = 178          # 이상 = 빈 컬럼(흡수 완료) 확정. LOW~HIGH 사이 = 빈 컬럼(한 가지 규칙)
+SHARPNESS_SMOOTH_ALPHA = 0.85 # EMA 스무딩 (표시/판별 안정화). 0=미사용
+
+# --- CNT 감지 (밝기) - 카메라/캘리브레이션 보면서 이 범위만 조정 ---
+CNT_BRIGHTNESS_LOW = 65       # 이하 = CNT 있음 (밝기 낮음)
+CNT_BRIGHTNESS_HIGH = 75     # 이상 = 흡수 완료 (밝기 높음). LOW~HIGH 구간은 허스트리시스
 
 # --- 파일 ---
 ROI_FILE = 'roi_settings.json'
@@ -111,14 +122,42 @@ def get_brightness(gray):
     return gray.mean()
 
 
+def get_sharpness(gray):
+    """선명도: Laplacian variance. 용액 있음=낮음, 빈 컬럼=높음."""
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    return float(lap.var())
+
+
+_sharpness_smooth = None
+
+
+def reset_sharpness_smooth():
+    global _sharpness_smooth
+    _sharpness_smooth = None
+
+
+def get_smoothed_sharpness(gray):
+    """Sharpness EMA 스무딩. 표시/판별 시 숫자 흔들림 완화."""
+    global _sharpness_smooth
+    raw = get_sharpness(gray)
+    if SHARPNESS_SMOOTH_ALPHA <= 0:
+        return raw
+    if _sharpness_smooth is None:
+        _sharpness_smooth = raw
+        return raw
+    _sharpness_smooth = SHARPNESS_SMOOTH_ALPHA * _sharpness_smooth + (1 - SHARPNESS_SMOOTH_ALPHA) * raw
+    return _sharpness_smooth
+
+
 def get_line_bend(gray):
+    """굴곡 지표: std(y) + y범위(max-min)/scale. 투명 용액 있을 때 둘 다 커질 수 있음."""
     threshold = gray.mean() + 30
     bright_mask = gray > threshold
     
     y_coords, x_coords = np.where(bright_mask)
     
     if len(y_coords) < 10:
-        return 0
+        return 0.0
     
     x_unique = np.unique(x_coords)
     y_means = []
@@ -126,12 +165,37 @@ def get_line_bend(gray):
     for x in x_unique:
         y_at_x = y_coords[x_coords == x]
         if len(y_at_x) > 0:
-            y_means.append(y_at_x.mean())
+            y_means.append(float(y_at_x.mean()))
     
     if len(y_means) < 5:
-        return 0
+        return 0.0
     
-    return np.std(y_means)
+    y_means = np.array(y_means)
+    std = float(np.std(y_means))
+    rng = float(np.max(y_means) - np.min(y_means))
+    # std만으론 부드러운 굴곡을 놓칠 수 있음 → range 반영 (empty: 둘 다 작음, transparent: range 큼)
+    return max(std, rng / LINE_BEND_RANGE_SCALE)
+
+
+_line_bend_smooth = None
+
+
+def reset_line_bend_smooth():
+    global _line_bend_smooth
+    _line_bend_smooth = None
+
+
+def get_smoothed_line_bend(gray):
+    """EMA 스무딩. 17~35 왔다갔다 줄여서 threshold 판정 안정화."""
+    global _line_bend_smooth
+    raw = get_line_bend(gray)
+    if LINE_BEND_SMOOTH_ALPHA <= 0:
+        return raw
+    if _line_bend_smooth is None:
+        _line_bend_smooth = raw
+        return raw
+    _line_bend_smooth = LINE_BEND_SMOOTH_ALPHA * _line_bend_smooth + (1 - LINE_BEND_SMOOTH_ALPHA) * raw
+    return _line_bend_smooth
 
 
 def beep_alert():
@@ -176,10 +240,13 @@ def select_roi():
             roi_frame = frame[y1:y2, x1:x2]
             gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
             line_bend = get_line_bend(gray)
+            sharpness = get_sharpness(gray)
             brightness = get_brightness(gray)
             
-            cv2.putText(display, f"Line Bend: {line_bend:.1f}", (x1, y1-35),
+            cv2.putText(display, f"Line Bend: {line_bend:.1f}", (x1, y1-55),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(display, f"Sharpness: {sharpness:.0f}", (x1, y1-35),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
             cv2.putText(display, f"Brightness: {brightness:.1f}", (x1, y1-10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
@@ -225,27 +292,30 @@ def live_view():
             gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
             
             line_bend = get_line_bend(gray)
+            sharpness = get_smoothed_sharpness(gray)
             brightness = get_brightness(gray)
             
             cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
             
             cv2.putText(display, f"Line Bend: {line_bend:.1f}", (10, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.putText(display, f"Brightness: {brightness:.1f}", (10, 60),
+            cv2.putText(display, f"Sharpness: {sharpness:.0f}", (10, 55),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
+            cv2.putText(display, f"Brightness: {brightness:.1f}", (10, 80),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
-            # 상태 표시
-            if line_bend > LINE_BEND_THRESHOLD:
-                status = "투명 용액 있음"
-                color = (0, 255, 255)
-            elif brightness < CNT_THRESHOLD:
-                status = "CNT 있음"
+            # 판별: Sharpness만. 용액 있음=LOW 이하, 그 외(사이+HIGH 이상)=빈 컬럼 (한 가지 규칙)
+            if brightness < CNT_BRIGHTNESS_LOW:
+                status = "CNT present"
                 color = (0, 0, 255)
+            elif sharpness < SHARPNESS_LOW:
+                status = "Transparent"
+                color = (0, 255, 255)
             else:
-                status = "비어있음 (젤만)"
+                status = "Empty (gel only)"
                 color = (0, 255, 0)
             
-            cv2.putText(display, f"Status: {status}", (10, 90),
+            cv2.putText(display, f"Status: {status}", (10, 110),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         cv2.imshow("Live View", display)
@@ -290,6 +360,7 @@ def calibrate():
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
         
         line_bend = get_line_bend(gray)
+        sharpness = get_sharpness(gray)
         brightness = get_brightness(gray)
         
         display = frame.copy()
@@ -297,10 +368,12 @@ def calibrate():
         
         cv2.putText(display, f"Line Bend: {line_bend:.1f}", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(display, f"Brightness: {brightness:.1f}", (10, 60),
+        cv2.putText(display, f"Sharpness: {sharpness:.0f}", (10, 55),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
+        cv2.putText(display, f"Brightness: {brightness:.1f}", (10, 80),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         
-        y_pos = 100
+        y_pos = 110
         for key, val in vals.items():
             cv2.putText(display, f"[{key}] {val}", (10, y_pos),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
@@ -311,16 +384,16 @@ def calibrate():
         key = cv2.waitKey(1) & 0xFF
         
         if key == ord('1'):
-            vals['1'] = f"투명 있음: Bend={line_bend:.1f}"
-            print(f"✅ [1] 투명 있음: Line Bend = {line_bend:.1f}")
+            vals['1'] = f"Transparent: Bend={line_bend:.1f} Sharp={sharpness:.0f}"
+            print(f"✅ [1] 투명 있음: Line Bend = {line_bend:.1f}, Sharpness = {sharpness:.0f}")
         elif key == ord('2'):
-            vals['2'] = f"빈 상태: Bend={line_bend:.1f}"
-            print(f"✅ [2] 빈 상태: Line Bend = {line_bend:.1f}")
+            vals['2'] = f"Empty: Bend={line_bend:.1f} Sharp={sharpness:.0f}"
+            print(f"✅ [2] 빈 상태: Line Bend = {line_bend:.1f}, Sharpness = {sharpness:.0f}")
         elif key == ord('3'):
-            vals['3'] = f"CNT 있음: Bright={brightness:.1f}"
+            vals['3'] = f"CNT: Bright={brightness:.1f}"
             print(f"✅ [3] CNT 있음: Brightness = {brightness:.1f}")
         elif key == ord('4'):
-            vals['4'] = f"CNT 후: Bright={brightness:.1f}"
+            vals['4'] = f"CNT done: Bright={brightness:.1f}"
             print(f"✅ [4] CNT 후: Brightness = {brightness:.1f}")
         elif key == ord('q'):
             break
@@ -330,6 +403,7 @@ def calibrate():
     
     print("\n" + "="*40)
     print("  코드 상단 [설정]에 입력하세요!")
+    print("  LINE_BEND_HIGH/LOW, SHARPNESS_HIGH/LOW 확인")
     print("="*40)
 
 
@@ -371,6 +445,8 @@ def full_cycle_test():
     cycle_count = 0
     
     print("\n🚀 시작! 투명 용액을 넣으세요...")
+    reset_line_bend_smooth()
+    reset_sharpness_smooth()
     
     while True:
         ret, frame = read_frame(cap)
@@ -380,17 +456,17 @@ def full_cycle_test():
         roi_frame = frame[y1:y2, x1:x2]
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
         
-        line_bend = get_line_bend(gray)
+        line_bend = get_smoothed_line_bend(gray)
+        sharpness = get_smoothed_sharpness(gray)
         brightness = get_brightness(gray)
         
         display = frame.copy()
         
         # ============================================
-        # 상태 1: 투명 용액 넣기 대기
+        # 상태 1: 투명 용액 넣기 대기 (용액 있음=LOW 이하, 사이=리셋 한 가지 규칙)
         # ============================================
         if state == 'wait_transparent_add':
-            # Line Bend 증가 = 투명 용액 넣음
-            if line_bend > LINE_BEND_THRESHOLD:
+            if sharpness < SHARPNESS_LOW:
                 stable_counter += 1
             else:
                 stable_counter = 0
@@ -402,16 +478,15 @@ def full_cycle_test():
                 state = 'wait_transparent_absorb'
                 stable_counter = 0
             
-            status = f"[투명 넣기 대기] Line Bend: {line_bend:.1f}"
+            status = f"[Wait Add Transparent] Bend: {line_bend:.1f} Sharp: {sharpness:.0f}"
             color = (255, 255, 0)  # 시안
-            instruction = ">>> 투명 용액을 넣으세요! <<<"
+            instruction = ">>> Add transparent solution! <<<"
         
         # ============================================
-        # 상태 2: 투명 용액 흡수 대기
+        # 상태 2: 투명 용액 흡수 대기 (빈 컬럼=HIGH 이상, 사이=리셋 한 가지 규칙)
         # ============================================
         elif state == 'wait_transparent_absorb':
-            # Line Bend 감소 = 흡수 완료
-            if line_bend < LINE_BEND_THRESHOLD:
+            if sharpness > SHARPNESS_HIGH:
                 stable_counter += 1
             else:
                 stable_counter = 0
@@ -424,16 +499,16 @@ def full_cycle_test():
                 stable_counter = 0
                 cycle_count += 1
             
-            status = f"[투명 흡수 중] Line Bend: {line_bend:.1f}"
+            status = f"[Transparent absorbing] Bend: {line_bend:.1f} Sharp: {sharpness:.0f}"
             color = (0, 255, 255)  # 노랑
-            instruction = "투명 용액 흡수 중..."
+            instruction = "Transparent absorbing..."
         
         # ============================================
         # 상태 3: CNT 넣기 대기
         # ============================================
         elif state == 'wait_cnt_add':
             # 밝기 감소 = CNT 넣음
-            if brightness < CNT_THRESHOLD:
+            if brightness < CNT_BRIGHTNESS_LOW:
                 stable_counter += 1
             else:
                 stable_counter = 0
@@ -445,16 +520,16 @@ def full_cycle_test():
                 state = 'wait_cnt_absorb'
                 stable_counter = 0
             
-            status = f"[CNT 넣기 대기] Brightness: {brightness:.1f}"
+            status = f"[Wait Add CNT] Brightness: {brightness:.1f}"
             color = (0, 165, 255)  # 주황
-            instruction = ">>> CNT를 넣으세요! <<<"
+            instruction = ">>> Add CNT! <<<"
         
         # ============================================
         # 상태 4: CNT 흡수 대기
         # ============================================
         elif state == 'wait_cnt_absorb':
             # 밝기 증가 = 흡수 완료
-            if brightness > CNT_THRESHOLD:
+            if brightness > CNT_BRIGHTNESS_HIGH:
                 stable_counter += 1
             else:
                 stable_counter = 0
@@ -466,9 +541,9 @@ def full_cycle_test():
                 state = 'wait_transparent_add'
                 stable_counter = 0
             
-            status = f"[CNT 흡수 중] Brightness: {brightness:.1f}"
+            status = f"[CNT absorbing] Brightness: {brightness:.1f}"
             color = (0, 0, 255)  # 빨강
-            instruction = "CNT 흡수 중..."
+            instruction = "CNT absorbing..."
         
         # 화면 표시
         cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
@@ -483,7 +558,7 @@ def full_cycle_test():
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         
         # 값 표시
-        cv2.putText(display, f"Line Bend: {line_bend:.1f}", (10, display.shape[0]-50),
+        cv2.putText(display, f"Line Bend: {line_bend:.1f}  Sharpness: {sharpness:.0f}", (10, display.shape[0]-50),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         cv2.putText(display, f"Brightness: {brightness:.1f}", (10, display.shape[0]-30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
@@ -527,17 +602,19 @@ def monitor_transparent():
         roi_frame = frame[y1:y2, x1:x2]
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
         line_bend = get_line_bend(gray)
+        sharpness = get_smoothed_sharpness(gray)
         
-        if line_bend < LINE_BEND_THRESHOLD:
-            status = "✅ 흡수 완료!"
-            color = (0, 255, 0)
-        else:
-            status = "💧 용액 있음"
+        # 판별: 용액 있음=LOW 이하, 그 외(사이+HIGH)=Absorbed (한 가지 규칙)
+        if sharpness < SHARPNESS_LOW:
+            status = "Solution present"
             color = (0, 255, 255)
+        else:
+            status = "Absorbed"
+            color = (0, 255, 0)
         
         display = frame.copy()
         cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(display, f"Line Bend: {line_bend:.1f}", (10, 30),
+        cv2.putText(display, f"Line Bend: {line_bend:.1f}  Sharpness: {sharpness:.0f}", (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         cv2.putText(display, status, (10, 60),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
@@ -578,12 +655,13 @@ def monitor_cnt():
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
         brightness = get_brightness(gray)
         
-        if brightness > CNT_THRESHOLD:
-            status = "✅ CNT 흡수 완료!"
-            color = (0, 255, 0)
-        else:
-            status = "⚫ CNT 있음"
+        # 판별: CNT 있음=LOW 이하, 그 외(사이+HIGH)=흡수 완료 (한 가지 규칙)
+        if brightness < CNT_BRIGHTNESS_LOW:
+            status = "CNT present"
             color = (0, 0, 255)
+        else:
+            status = "CNT absorbed"
+            color = (0, 255, 0)
         
         display = frame.copy()
         cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
@@ -629,14 +707,16 @@ def wait_for_transparent_absorbed(timeout=300):
         roi_frame = frame[y1:y2, x1:x2]
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
         line_bend = get_line_bend(gray)
+        sharpness = get_smoothed_sharpness(gray)
         
-        if line_bend < LINE_BEND_THRESHOLD:
+        # 흡수 완료 = Sharp > HIGH (사이=리셋 한 가지 규칙)
+        if sharpness > SHARPNESS_HIGH:
             stable_counter += 1
         else:
             stable_counter = 0
         
         elapsed = time.time() - start_time
-        print(f"\r   경과: {elapsed:.0f}초 | Line Bend: {line_bend:.1f} | Stable: {stable_counter}/{STABLE_COUNT}    ", 
+        print(f"\r   경과: {elapsed:.0f}초 | Bend: {line_bend:.1f} Sharp: {sharpness:.0f} | Stable: {stable_counter}/{STABLE_COUNT}    ", 
               end='', flush=True)
         
         if stable_counter >= STABLE_COUNT:
@@ -676,7 +756,7 @@ def wait_for_cnt_absorbed(timeout=300):
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
         brightness = get_brightness(gray)
         
-        if brightness > CNT_THRESHOLD:
+        if brightness > CNT_BRIGHTNESS_HIGH:
             stable_counter += 1
         else:
             stable_counter = 0
@@ -709,8 +789,11 @@ def main():
         
         roi = load_roi()
         print(f"  ROI: {roi if roi else '❌ 없음'}")
-        print(f"  LINE_BEND_THRESHOLD: {LINE_BEND_THRESHOLD}")
-        print(f"  CNT_THRESHOLD: {CNT_THRESHOLD}")
+        print(f"  LINE_BEND HIGH/LOW: {LINE_BEND_HIGH} / {LINE_BEND_LOW}")
+        print(f"  SHARPNESS HIGH/LOW: {SHARPNESS_HIGH} / {SHARPNESS_LOW} (용액 있음=낮음, 빈 컬럼=높음)")
+        print(f"  LINE_BEND_SMOOTH_ALPHA: {LINE_BEND_SMOOTH_ALPHA}")
+        print(f"  SHARPNESS_SMOOTH_ALPHA: {SHARPNESS_SMOOTH_ALPHA}")
+        print(f"  CNT Brightness LOW/HIGH: {CNT_BRIGHTNESS_LOW} / {CNT_BRIGHTNESS_HIGH} (한 가지 규칙: 사이=흡수완료)")
         
         print("""
   [설정]
@@ -749,3 +832,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
