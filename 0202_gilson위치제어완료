@@ -1,0 +1,425 @@
+#!/usr/bin/env python3
+"""
+Gilson FC-203B 명령어 테스트
+튜브 이동, 수집 시작/정지 등 기본 제어 테스트
+
+사용법:
+  python fc203b_control_test.py COM4
+"""
+
+import serial
+import time
+import sys
+
+# ============================================
+# 설정
+# ============================================
+BAUD_RATE = 19200
+UNIT_ID = 6
+TIMEOUT = 1.0
+
+# GSIOC 상수
+DISCONNECT_ALL = 0xFF
+ACK = 0x06
+
+
+class FC203B:
+    """FC-203B 제어 클래스"""
+    
+    def __init__(self, port, unit_id=6):
+        self.port = port
+        self.unit_id = unit_id
+        self.ser = None
+    
+    def connect(self):
+        """시리얼 포트 열기"""
+        try:
+            self.ser = serial.Serial(
+                port=self.port,
+                baudrate=BAUD_RATE,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_EVEN,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=TIMEOUT
+            )
+            return True
+        except Exception as e:
+            print(f"포트 열기 실패: {e}")
+            return False
+    
+    def disconnect(self):
+        """시리얼 포트 닫기"""
+        if self.ser:
+            self.ser.close()
+    
+    def _connect_gsioc(self):
+        """GSIOC 슬레이브 연결"""
+        binary_name = self.unit_id + 128
+        
+        self.ser.reset_input_buffer()
+        self.ser.write(bytes([DISCONNECT_ALL]))
+        self.ser.flush()
+        time.sleep(0.03)
+        
+        self.ser.reset_input_buffer()
+        self.ser.write(bytes([binary_name]))
+        self.ser.flush()
+        
+        start = time.time()
+        while time.time() - start < 0.2:
+            if self.ser.in_waiting > 0:
+                resp = self.ser.read(1)
+                if resp and resp[0] == binary_name:
+                    return True
+            time.sleep(0.01)
+        return False
+    
+    def immediate_command(self, cmd):
+        """
+        Immediate Command 전송
+        단일 문자 명령, 즉시 응답
+        """
+        if not self._connect_gsioc():
+            return None
+        
+        self.ser.write(cmd.encode('ascii'))
+        self.ser.flush()
+        
+        response = []
+        start = time.time()
+        
+        while time.time() - start < TIMEOUT:
+            if self.ser.in_waiting > 0:
+                byte = self.ser.read(1)
+                if byte:
+                    value = byte[0]
+                    if value >= 128:
+                        response.append(chr(value - 128))
+                        break
+                    else:
+                        response.append(chr(value))
+                        self.ser.write(bytes([ACK]))
+                        self.ser.flush()
+            time.sleep(0.01)
+        
+        return ''.join(response)
+    
+    def buffered_command(self, cmd):
+        """
+        Buffered Command 전송
+        형식: LF + 명령문자열 + CR
+        """
+        if not self._connect_gsioc():
+            return False
+        
+        LF = 0x0A
+        CR = 0x0D
+        
+        # LF 전송
+        self.ser.write(bytes([LF]))
+        self.ser.flush()
+        time.sleep(0.02)
+        
+        # LF 에코 대기
+        start = time.time()
+        lf_ok = False
+        while time.time() - start < 0.5:
+            if self.ser.in_waiting > 0:
+                resp = self.ser.read(1)
+                if resp[0] == LF:
+                    lf_ok = True
+                    break
+                elif resp[0] == 0x23:  # '#' = busy
+                    time.sleep(0.1)
+                    self.ser.write(bytes([LF]))
+                    self.ser.flush()
+            time.sleep(0.01)
+        
+        if not lf_ok:
+            return False
+        
+        # 명령 문자열 전송
+        for char in cmd:
+            self.ser.write(char.encode('ascii'))
+            self.ser.flush()
+            time.sleep(0.015)
+            if self.ser.in_waiting > 0:
+                self.ser.read(1)  # 에코 읽기
+        
+        # CR 전송
+        self.ser.write(bytes([CR]))
+        self.ser.flush()
+        time.sleep(0.05)
+        
+        return True
+    
+    # ========================================
+    # 편의 메서드들
+    # ========================================
+    
+    def get_info(self):
+        """장비 정보"""
+        return self.immediate_command('%')
+    
+    def get_status(self):
+        """상태"""
+        return self.immediate_command('S')
+    
+    def get_tube(self):
+        """현재 튜브 번호"""
+        resp = self.immediate_command('T')
+        if resp:
+            try:
+                return int(resp)
+            except:
+                return resp
+        return None
+    
+    def goto_tube(self, tube_num):
+        """특정 튜브로 이동"""
+        return self.buffered_command(f'G{tube_num}')
+    
+    def advance_tube(self):
+        """다음 튜브로 이동"""
+        return self.buffered_command('A')
+    
+    def set_remote(self):
+        """리모트 모드 설정"""
+        return self.buffered_command('SR')
+    
+    def set_local(self):
+        """로컬 모드 설정"""
+        return self.buffered_command('SL')
+    
+    def start_run(self):
+        """수집 시작"""
+        return self.buffered_command('R')
+    
+    def end_run(self):
+        """수집 종료"""
+        return self.buffered_command('E')
+    
+    def home(self):
+        """홈 위치로"""
+        return self.buffered_command('H')
+    
+    def valve_collect(self):
+        """밸브 - 수집 위치"""
+        return self.buffered_command('VC')
+    
+    def valve_waste(self):
+        """밸브 - 폐기 위치"""
+        return self.buffered_command('VW')
+
+
+def interactive_test(port):
+    """대화형 테스트 모드"""
+    
+    fc = FC203B(port, UNIT_ID)
+    
+    if not fc.connect():
+        return
+    
+    print(f"""
+{'='*55}
+  FC-203B 명령어 테스트
+{'='*55}
+  포트: {port} | Unit ID: {UNIT_ID}
+{'='*55}
+
+  [정보 조회]
+    i   = 장비 정보 (%)
+    s   = 상태 (S)  
+    t   = 현재 튜브 번호 (T)
+
+  [튜브 이동]
+    g숫자 = 해당 튜브로 이동 (예: g5, g10)
+    a    = 다음 튜브로 이동
+    h    = 홈 위치
+
+  [수집 제어]
+    r    = 수집 시작 (Run)
+    e    = 수집 종료 (End)
+
+  [모드]
+    sr   = 리모트 모드
+    sl   = 로컬 모드
+
+  [밸브] (3-way valve 있는 경우)
+    vc   = 수집 위치
+    vw   = 폐기 위치
+
+  [직접 명령]
+    !명령  = Immediate 직접 전송 (예: !%)
+    @명령  = Buffered 직접 전송 (예: @G5)
+
+  [종료]
+    q    = 종료
+
+{'='*55}
+""")
+    
+    # 초기 정보 출력
+    print("장비 연결 확인 중...")
+    info = fc.get_info()
+    if info:
+        print(f"  ✓ 연결됨: {info}")
+        tube = fc.get_tube()
+        print(f"  ✓ 현재 튜브: {tube}")
+    else:
+        print("  ✗ 응답 없음")
+    print()
+    
+    while True:
+        try:
+            cmd = input(">> ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            break
+        
+        if not cmd:
+            continue
+        
+        result = None
+        
+        # 정보 조회
+        if cmd == 'i':
+            result = fc.get_info()
+            print(f"  장비 정보: {result}")
+        
+        elif cmd == 's':
+            result = fc.get_status()
+            print(f"  상태: {result}")
+        
+        elif cmd == 't':
+            result = fc.get_tube()
+            print(f"  현재 튜브: {result}")
+        
+        # 튜브 이동
+        elif cmd.startswith('g') and len(cmd) > 1:
+            try:
+                tube_num = int(cmd[1:])
+                print(f"  튜브 {tube_num}으로 이동 중...")
+                if fc.goto_tube(tube_num):
+                    time.sleep(0.5)
+                    new_tube = fc.get_tube()
+                    print(f"  ✓ 완료. 현재 튜브: {new_tube}")
+                else:
+                    print("  ✗ 명령 실패")
+            except ValueError:
+                print("  숫자를 입력하세요 (예: g5)")
+        
+        elif cmd == 'a':
+            print("  다음 튜브로 이동...")
+            if fc.advance_tube():
+                time.sleep(0.3)
+                new_tube = fc.get_tube()
+                print(f"  ✓ 완료. 현재 튜브: {new_tube}")
+            else:
+                print("  ✗ 명령 실패")
+        
+        elif cmd == 'h':
+            print("  홈으로 이동...")
+            if fc.home():
+                print("  ✓ 완료")
+            else:
+                print("  ✗ 명령 실패")
+        
+        # 수집 제어
+        elif cmd == 'r':
+            print("  수집 시작...")
+            if fc.start_run():
+                print("  ✓ Run 명령 전송됨")
+            else:
+                print("  ✗ 명령 실패")
+        
+        elif cmd == 'e':
+            print("  수집 종료...")
+            if fc.end_run():
+                print("  ✓ End 명령 전송됨")
+            else:
+                print("  ✗ 명령 실패")
+        
+        # 모드
+        elif cmd == 'sr':
+            print("  리모트 모드 설정...")
+            if fc.set_remote():
+                print("  ✓ Remote 모드")
+            else:
+                print("  ✗ 명령 실패")
+        
+        elif cmd == 'sl':
+            print("  로컬 모드 설정...")
+            if fc.set_local():
+                print("  ✓ Local 모드")
+            else:
+                print("  ✗ 명령 실패")
+        
+        # 밸브
+        elif cmd == 'vc':
+            print("  밸브 → 수집...")
+            if fc.valve_collect():
+                print("  ✓ 완료")
+            else:
+                print("  ✗ 명령 실패")
+        
+        elif cmd == 'vw':
+            print("  밸브 → 폐기...")
+            if fc.valve_waste():
+                print("  ✓ 완료")
+            else:
+                print("  ✗ 명령 실패")
+        
+        # 직접 명령
+        elif cmd.startswith('!') and len(cmd) > 1:
+            imm_cmd = cmd[1].upper()
+            print(f"  Immediate '{imm_cmd}' 전송...")
+            result = fc.immediate_command(imm_cmd)
+            print(f"  응답: {result}")
+        
+        elif cmd.startswith('@') and len(cmd) > 1:
+            buf_cmd = cmd[1:].upper()
+            print(f"  Buffered '{buf_cmd}' 전송...")
+            if fc.buffered_command(buf_cmd):
+                print("  ✓ 전송됨")
+            else:
+                print("  ✗ 실패")
+        
+        # 종료
+        elif cmd == 'q':
+            print("종료합니다.")
+            break
+        
+        else:
+            print("  ? 알 수 없는 명령. 도움말: i, s, t, g숫자, a, h, r, e, q")
+    
+    fc.disconnect()
+
+
+def main():
+    print("="*50)
+    print("  Gilson FC-203B 명령어 테스트")
+    print("="*50)
+    
+    # 포트 확인
+    import serial.tools.list_ports
+    ports = list(serial.tools.list_ports.comports())
+    
+    print("\n사용 가능한 포트:")
+    for p in ports:
+        print(f"  {p.device}: {p.description}")
+    
+    # 포트 선택
+    if len(sys.argv) > 1:
+        port = sys.argv[1]
+    else:
+        port = input("\n포트 입력 (예: COM4): ").strip()
+    
+    if not port:
+        print("포트를 입력하세요.")
+        return
+    
+    interactive_test(port)
+
+
+if __name__ == "__main__":
+    main()
