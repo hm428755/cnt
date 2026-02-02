@@ -1,0 +1,191 @@
+"""
+EMS Tech EMP-2000W 펌프 클래스
+순환용 / 주입용 공용
+
+매뉴얼 기준:
+- Read: Function Code 0x04
+- Write: Function Code 0x10
+"""
+
+import sys
+import subprocess
+import time
+
+try:
+    import minimalmodbus
+except ImportError:
+    print("⚠️ minimalmodbus 설치 중...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "minimalmodbus"])
+    import minimalmodbus
+    print("✅ 설치 완료!")
+
+
+class Pump:
+    
+    # --- 레지스터 주소 ---
+    ADDR_MODE      = 0x2000   # 0=RPM Mode, 1=Revolution Mode
+    ADDR_DIR       = 0x2001   # 0=CW, 1=CCW
+    ADDR_SPEED_INT = 0x2002   # RPM 정수부
+    ADDR_SPEED_DEC = 0x2003   # RPM 소수부
+    ADDR_REV_INT   = 0x2004   # 회전수 정수부
+    ADDR_REV_DEC   = 0x2005   # 회전수 소수부
+    ADDR_SLOPE_INT = 0x2009   # rev/mL 정수부 (R)
+    ADDR_SLOPE_DEC = 0x200A   # rev/mL 소수부 (R)
+    ADDR_CLEAR_TOT = 0x200B   # 총 유량 초기화
+    ADDR_RUN_STOP  = 0x200C   # 0=Stop, 1=Start
+    
+    ADDR_STATUS    = 0x3006   # 상태 (Bit0: 0=Stop, 1=Run)
+    ADDR_CUR_SPEED = 0x3004   # 현재 RPM (R)
+    ADDR_CUR_LITER = 0x300B   # 현재 이송량 mL (R)
+    
+    MODE_RPM = 0
+    MODE_REV = 1
+    
+    def __init__(self, port, slave_id, name="펌프", baudrate=9600, rev_per_ml=None):
+        self.port = port
+        self.slave_id = slave_id
+        self.name = name
+        self.baudrate = baudrate
+        self._rev_per_ml = rev_per_ml
+        self.instrument = None
+    
+    @property
+    def rev_per_ml(self):
+        return self._rev_per_ml
+    
+    # ============================================================
+    #                      연결 / 해제
+    # ============================================================
+    
+    def connect(self):
+        """펌프 연결"""
+        self.instrument = minimalmodbus.Instrument(self.port, self.slave_id)
+        self.instrument.serial.baudrate = self.baudrate
+        self.instrument.serial.timeout = 2.0
+        print(f"✅ [{self.name}] 연결 ({self.port}/ID:{self.slave_id})")
+        
+        # rev/mL 미지정이면 펌프에서 읽어옴
+        if self._rev_per_ml is None:
+            self._read_rev_per_ml()
+        
+        print(f"   rev/mL: {self._rev_per_ml}")
+    
+    def disconnect(self):
+        """정지 + 연결 해제"""
+        self.stop()
+        print(f"🔌 [{self.name}] 연결 해제")
+    
+    # ============================================================
+    #                      내부 유틸
+    # ============================================================
+    
+    def _write_float(self, addr, value):
+        """실수를 [정수, 소수] 두 레지스터에 쓰기"""
+        int_part = int(value)
+        dec_part = int(round((value - int_part) * 100))
+        self.instrument.write_registers(addr, [int_part, dec_part])
+    
+    def _read_rev_per_ml(self):
+        """펌프에서 rev/mL 캘리브레이션 값 읽기 (0x2009~0x200A)"""
+        regs = self.instrument.read_registers(
+            self.ADDR_SLOPE_INT, 2, functioncode=4
+        )
+        # 매뉴얼: 소수부는 0~0.999 (0x03E7 = 999)
+        self._rev_per_ml = regs[0] + regs[1] / 1000.0
+        print(f"📖 [{self.name}] 펌프에서 rev/mL 읽음: {self._rev_per_ml}")
+    
+    def _flow_to_rpm(self, flow_rate):
+        """ml/min → RPM"""
+        return flow_rate * self._rev_per_ml
+    
+    def _volume_to_rev(self, volume_ml):
+        """ml → 회전수"""
+        return volume_ml * self._rev_per_ml
+    
+    # ============================================================
+    #                      상태 읽기
+    # ============================================================
+    
+    def is_running(self):
+        """펌프 동작 중인지 (0x3006 Bit 0)"""
+        status = self.instrument.read_register(
+            self.ADDR_STATUS, functioncode=4
+        )
+        return bool(status & 0x01)
+    
+    def read_current_speed(self):
+        """현재 RPM 읽기"""
+        regs = self.instrument.read_registers(
+            self.ADDR_CUR_SPEED, 2, functioncode=4
+        )
+        return regs[0] + regs[1] / 100.0
+    
+    # ============================================================
+    #                      제어
+    # ============================================================
+    
+    def start(self):
+        """펌프 ON"""
+        self.instrument.write_registers(self.ADDR_RUN_STOP, [1])
+        print(f"▶️ [{self.name}] ON")
+    
+    def stop(self):
+        """펌프 OFF"""
+        try:
+            self.instrument.write_registers(self.ADDR_RUN_STOP, [0])
+            print(f"⏹️ [{self.name}] 정지")
+        except:
+            pass
+    
+    def run_continuous(self, flow_rate):
+        """연속 모드 시작"""
+        rpm = self._flow_to_rpm(flow_rate)
+        
+        self.instrument.write_registers(self.ADDR_MODE, [self.MODE_RPM])
+        time.sleep(0.1)
+        self._write_float(self.ADDR_SPEED_INT, rpm)
+        time.sleep(0.1)
+        self.start()
+        
+        print(f"🔄 [{self.name}] 연속 @ {flow_rate} ml/min ({rpm:.2f} RPM)")
+    
+    def set_flow_rate(self, flow_rate):
+        """속도 변경 (멈추지 않음)"""
+        rpm = self._flow_to_rpm(flow_rate)
+        
+        self._write_float(self.ADDR_SPEED_INT, rpm)
+        print(f"⚡ [{self.name}] 속도 변경 → {flow_rate} ml/min ({rpm:.2f} RPM)")
+    
+    def run_volume_then_switch(self, volume_ml, fast_rate, slow_rate):
+        """정량 주입 후 자동으로 느린 속도로 전환
+        
+        Revolution Mode → 자동 정지 감지 → 연속 모드 전환
+        """
+        rpm = self._flow_to_rpm(fast_rate)
+        rev = self._volume_to_rev(volume_ml)
+        expected_min = volume_ml / fast_rate
+        
+        print(f"\n📋 [{self.name}] 정량 주입")
+        print(f"   {volume_ml}ml @ {fast_rate} ml/min")
+        print(f"   {rev:.1f} rev ({rpm:.2f} RPM)")
+        print(f"   예상: {expected_min:.1f}분")
+        print(f"   완료 후 → {slow_rate} ml/min 자동 전환")
+        
+        # Revolution Mode 설정
+        self.instrument.write_registers(self.ADDR_MODE, [self.MODE_REV])
+        time.sleep(0.1)
+        self._write_float(self.ADDR_SPEED_INT, rpm)
+        time.sleep(0.1)
+        self._write_float(self.ADDR_REV_INT, rev)
+        time.sleep(0.1)
+        self.start()
+        
+        # 자동 정지 대기 (polling)
+        print(f"⏳ [{self.name}] 주입 중...")
+        while self.is_running():
+            time.sleep(2)
+        
+        print(f"✅ [{self.name}] {volume_ml}ml 완료!")
+        
+        # 연속 모드로 전환
+        self.run_continuous(slow_rate)
