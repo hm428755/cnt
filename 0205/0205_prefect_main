@@ -1,0 +1,414 @@
+"""
+CNT 크로마토그래피 통합 실험 시스템 (Prefect + OOP)
+
+구조:
+- DeviceManager: 모든 장비 통합 관리
+- @task: 개별 작업 단위
+- @flow: 전체 워크플로우
+"""
+
+import time
+from prefect import flow, task, get_run_logger
+from typing import Optional
+
+from devices.pump import Pump
+from devices.gilson import Gilson
+from devices.jasco import Jasco
+from devices.valve import Valve
+from classifier import classify_csv
+from config import *
+
+
+# ================================================================
+#                    DeviceManager - 장비 통합 관리
+# ================================================================
+
+class DeviceManager:
+    """모든 장비를 통합 관리하는 클래스"""
+
+    def __init__(self):
+        # 장비 객체
+        self.pump_inj: Optional[Pump] = None
+        self.pump_circ: Optional[Pump] = None
+        self.valve: Optional[Valve] = None
+        self.gilson: Optional[Gilson] = None
+        self.jasco: Optional[Jasco] = None
+
+        # 연결 상태
+        self.valve_ok = False
+        self.gilson_ok = False
+        self.jasco_ok = False
+
+    def connect_all(self) -> dict:
+        """모든 장비 연결"""
+        status = {}
+
+        # 주입 펌프
+        self.pump_inj = Pump(
+            **PUMP_INJECTION,
+            baudrate=BAUDRATE,
+            rev_per_ml=REV_PER_ML,
+        )
+        self.pump_inj.connect()
+        status['pump_inj'] = True
+
+        # 순환 펌프
+        self.pump_circ = Pump(
+            **PUMP_CIRCULATION,
+            baudrate=BAUDRATE,
+            rev_per_ml=REV_PER_ML,
+        )
+        self.pump_circ.connect()
+        status['pump_circ'] = True
+
+        # 밸브
+        self.valve = Valve(port=VALVE_PORT, baudrate=VALVE_BAUDRATE)
+        self.valve_ok = self.valve.connect()
+        status['valve'] = self.valve_ok
+
+        # Gilson
+        self.gilson = Gilson(port=GILSON_PORT, unit_id=GILSON_UNIT_ID)
+        self.gilson_ok = self.gilson.connect()
+        status['gilson'] = self.gilson_ok
+
+        # Jasco
+        self.jasco = Jasco(
+            window_title=JASCO_WINDOW_TITLE,
+            watch_dir=JASCO_WATCH_DIR,
+            output_dir=JASCO_OUTPUT_DIR,
+            confidence=JASCO_CONFIDENCE,
+            check_interval=JASCO_CHECK_INTERVAL,
+            on_new_csv=self._on_uv_csv,
+        )
+        self.jasco_ok = self.jasco.connect()
+        status['jasco'] = self.jasco_ok
+
+        return status
+
+    def disconnect_all(self):
+        """모든 장비 연결 해제"""
+        if self.jasco_ok and self.jasco:
+            self.jasco.disconnect()
+        if self.valve_ok and self.valve:
+            self.valve.disconnect()
+        if self.pump_inj:
+            self.pump_inj.disconnect()
+        if self.pump_circ:
+            self.pump_circ.disconnect()
+        if self.gilson_ok and self.gilson:
+            self.gilson.disconnect()
+
+    def _on_uv_csv(self, csv_path):
+        """UV CSV 콜백 → 분류 → Gilson 이동"""
+        print(f"\n{'─'*40}")
+        print(f"[자동분류] 새 스펙트럼: {csv_path.name}")
+
+        result = classify_csv(csv_path)
+        print(f"[자동분류] 결과: {result}")
+
+        if UV_TO_GILSON_DELAY > 0:
+            print(f"[자동분류] {UV_TO_GILSON_DELAY}초 대기...")
+            time.sleep(UV_TO_GILSON_DELAY)
+
+        if self.gilson_ok and self.gilson.connected:
+            self.gilson.collect(
+                result,
+                tube_metal=TUBE_METAL,
+                tube_semi=TUBE_SEMICONDUCTOR,
+            )
+        print(f"{'─'*40}")
+
+    # ────────────────────────────────────
+    # 펌프 조작
+    # ────────────────────────────────────
+
+    def inject_volume(self, volume_ml: float, flow_rate: float):
+        """주입펌프로 볼륨 주입 (완료 후 자동 정지)"""
+        self.pump_inj.run_volume(volume_ml, flow_rate)
+
+    def start_circulation(self, flow_rate: float):
+        """순환펌프 시작"""
+        self.pump_circ.run_continuous(flow_rate)
+
+    def stop_circulation(self):
+        """순환펌프 정지"""
+        self.pump_circ.stop()
+
+    # ────────────────────────────────────
+    # 밸브 조작
+    # ────────────────────────────────────
+
+    def valve_to_solution(self):
+        """밸브 → 용액(위)"""
+        if self.valve_ok:
+            self.valve.to_solution()
+
+    def valve_to_cnt(self):
+        """밸브 → CNT(밑)"""
+        if self.valve_ok:
+            self.valve.to_cnt()
+
+    # ────────────────────────────────────
+    # Gilson 조작
+    # ────────────────────────────────────
+
+    def gilson_to_waste(self):
+        """Gilson → 폐기 위치"""
+        if self.gilson_ok:
+            self.gilson.go_waste()
+
+    def gilson_collect(self, classification: str):
+        """Gilson 수집"""
+        if self.gilson_ok:
+            self.gilson.collect(
+                classification,
+                tube_metal=TUBE_METAL,
+                tube_semi=TUBE_SEMICONDUCTOR,
+            )
+
+    # ────────────────────────────────────
+    # Jasco 조작
+    # ────────────────────────────────────
+
+    def jasco_start(self):
+        """Jasco 모니터링 시작"""
+        if self.jasco_ok:
+            self.jasco.start_monitoring()
+
+    def jasco_stop(self):
+        """Jasco 모니터링 중단"""
+        if self.jasco_ok:
+            self.jasco.stop_monitoring()
+            return self.jasco.measurement_count
+        return 0
+
+
+# ================================================================
+#                    Prefect Tasks
+# ================================================================
+
+@task(name="컨디셔닝", retries=0)
+def task_conditioning(dm: DeviceManager):
+    """Phase 1: 컨디셔닝 400ml @ 0.5ml/min"""
+    logger = get_run_logger()
+
+    logger.info(f"컨디셔닝 시작: {CONDITIONING_VOLUME}ml @ {CONDITIONING_FLOW_RATE}ml/min")
+    
+    dm.gilson_to_waste()
+    dm.valve_to_solution()
+    
+    input("\n  ▶ 컨디셔닝 시작하려면 [Enter]...")
+    
+    dm.inject_volume(CONDITIONING_VOLUME, CONDITIONING_FLOW_RATE)
+    
+    logger.info("컨디셔닝 주입 완료")
+    
+    # 밸브 → CNT 자동 전환
+    dm.valve_to_cnt()
+    logger.info("밸브 → CNT(밑) 자동 전환")
+    
+    input("  ▶ 카메라로 흡수 확인 후 [Enter]...")
+    
+    return True
+
+
+@task(name="CNT 샘플", retries=0)
+def task_cnt_sample(dm: DeviceManager, cycle: int, start_circulation: bool = False):
+    """CNT 샘플 10ml @ 0.13ml/min"""
+    logger = get_run_logger()
+
+    logger.info(f"[사이클 {cycle}] CNT 샘플: {SAMPLE_VOLUME}ml @ {SAMPLE_FLOW_RATE}ml/min")
+    
+    # 밸브는 이미 CNT 위치
+    
+    if start_circulation:
+        logger.info("순환펌프 시작")
+        dm.start_circulation(SLOW_FLOW_RATE)
+        dm.jasco_start()
+        logger.info("Jasco 모니터링 시작")
+    
+    input("  ▶ CNT 주입 시작하려면 [Enter]...")
+    
+    dm.inject_volume(SAMPLE_VOLUME, SAMPLE_FLOW_RATE)
+    
+    logger.info("CNT 주입 완료")
+    
+    # 밸브 → 용액 자동 전환
+    dm.valve_to_solution()
+    logger.info("밸브 → 용액(위) 자동 전환")
+    
+    input("  ▶ 카메라로 흡수 확인 후 [Enter]...")
+    
+    return True
+
+
+@task(name="일루션", retries=0)
+def task_elution(dm: DeviceManager, cycle: int):
+    """일루션 60ml @ 0.13ml/min"""
+    logger = get_run_logger()
+
+    logger.info(f"[사이클 {cycle}] 일루션: {ELUTION_VOLUME}ml @ {ELUTION_FLOW_RATE}ml/min")
+    
+    # 밸브는 이미 용액 위치
+    
+    input("  ▶ 일루션 주입 시작하려면 [Enter]...")
+    
+    dm.inject_volume(ELUTION_VOLUME, ELUTION_FLOW_RATE)
+    
+    logger.info("일루션 주입 완료")
+    
+    # 밸브 → CNT 자동 전환 (다음 사이클 대비)
+    dm.valve_to_cnt()
+    logger.info("밸브 → CNT(밑) 자동 전환")
+    
+    input("  ▶ 카메라로 흡수 확인 후 [Enter]...")
+    
+    return True
+
+
+@task(name="Gilson 수동 테스트")
+def task_gilson_manual_test(dm: DeviceManager):
+    """수동 입력으로 Gilson 이동 테스트"""
+    if not dm.gilson_ok:
+        print("  [Gilson] 미연결 - 건너뜀")
+        return None
+
+    print("\n  ┌─────────────────────────────────┐")
+    print("  │  Gilson 분류 이동 테스트         │")
+    print("  │  1 = 금속    (튜브 %3d)         │" % TUBE_METAL)
+    print("  │  2 = 반도체  (튜브 %3d)         │" % TUBE_SEMICONDUCTOR)
+    print("  │  3 = 폐기    (drain)            │")
+    print("  │  s = 건너뛰기                    │")
+    print("  └─────────────────────────────────┘")
+
+    while True:
+        choice = input("  분류 결과 (1/2/3/s): ").strip()
+        if choice == "1":
+            dm.gilson_collect("금속")
+            return "금속"
+        elif choice == "2":
+            dm.gilson_collect("반도체")
+            return "반도체"
+        elif choice == "3":
+            dm.gilson_collect("폐기")
+            return "폐기"
+        elif choice.lower() == "s":
+            return None
+        else:
+            print("  → 1, 2, 3, s 중 하나를 입력하세요")
+
+
+# ================================================================
+#                    Prefect Flow
+# ================================================================
+
+@flow(name="CNT 크로마토그래피")
+def cnt_chromatography_flow():
+    """CNT 크로마토그래피 전체 워크플로우"""
+    logger = get_run_logger()
+
+    mode_str = "⚡ 테스트 모드" if TEST_MODE else "🔬 실제 실험"
+
+    print("\n" + "=" * 55)
+    print("   CNT 크로마토그래피 통합 제어 시스템")
+    print(f"   [{mode_str}] Prefect + OOP")
+    print("=" * 55)
+
+    # ──────────────────────────────────────
+    # 장비 연결
+    # ──────────────────────────────────────
+
+    dm = DeviceManager()
+    status = dm.connect_all()
+
+    logger.info(f"장비 연결 상태: {status}")
+    print(f"\n[장비 연결]")
+    print(f"  펌프(주입): ✓")
+    print(f"  펌프(순환): ✓")
+    print(f"  밸브: {'✓' if status['valve'] else '✗'}")
+    print(f"  Gilson: {'✓' if status['gilson'] else '✗'}")
+    print(f"  Jasco: {'✓' if status['jasco'] else '✗'}")
+
+    print("─" * 55)
+    print(f"  컨디셔닝: {CONDITIONING_VOLUME}ml @ {CONDITIONING_FLOW_RATE} ml/min")
+    print(f"  CNT 샘플: {SAMPLE_VOLUME}ml @ {SAMPLE_FLOW_RATE} ml/min")
+    print(f"  일루션: {ELUTION_VOLUME}ml @ {ELUTION_FLOW_RATE} ml/min")
+    print(f"  순환: {SLOW_FLOW_RATE} ml/min")
+    print(f"  반복: {NUM_CYCLES}회")
+    print("=" * 55)
+
+    try:
+        # ──────────────────────────────────────
+        # Phase 1: 컨디셔닝
+        # ──────────────────────────────────────
+
+        print("\n" + "=" * 55)
+        print("  Phase 1: 컨디셔닝")
+        est_min = CONDITIONING_VOLUME / CONDITIONING_FLOW_RATE
+        print(f"  예상 소요: {est_min:.1f}분")
+        print("=" * 55)
+
+        task_conditioning(dm)
+
+        # ──────────────────────────────────────
+        # Phase 2+: 사이클 반복
+        # ──────────────────────────────────────
+
+        for cycle in range(1, NUM_CYCLES + 1):
+            print("\n" + "★" * 55)
+            print(f"  사이클 {cycle}/{NUM_CYCLES}")
+            print("★" * 55)
+
+            # CNT 샘플 (첫 사이클에서 순환펌프 시작)
+            task_cnt_sample(dm, cycle, start_circulation=(cycle == 1))
+
+            # 일루션
+            task_elution(dm, cycle)
+
+            # Gilson 수동 테스트
+            task_gilson_manual_test(dm)
+
+            print(f"\n  ✓ 사이클 {cycle} 완료")
+
+            if cycle < NUM_CYCLES:
+                input(f"\n  다음 사이클({cycle+1}) 시작 [Enter]...")
+
+        # ──────────────────────────────────────
+        # 종료
+        # ──────────────────────────────────────
+
+        print("\n" + "=" * 55)
+        print("  실험 종료")
+        print("=" * 55)
+
+        measurement_count = dm.jasco_stop()
+        logger.info(f"Jasco 측정 횟수: {measurement_count}")
+
+        dm.valve_to_solution()
+
+        input("\n--- 순환펌프 정지하려면 [Enter] ---")
+        dm.stop_circulation()
+
+        print("\n" + "=" * 55)
+        print(f"  실험 완료! ({NUM_CYCLES}사이클)")
+        print(f"  총 UV 측정: {measurement_count}회")
+        print("=" * 55)
+
+        return {"cycles": NUM_CYCLES, "measurements": measurement_count}
+
+    except KeyboardInterrupt:
+        logger.warning("사용자 중단!")
+        print("\n\n긴급 중단!")
+
+    finally:
+        dm.disconnect_all()
+        logger.info("모든 장비 연결 해제")
+        print("\n시스템 종료")
+
+
+# ================================================================
+#                    실행
+# ================================================================
+
+if __name__ == "__main__":
+    cnt_chromatography_flow()
