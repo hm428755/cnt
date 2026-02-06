@@ -1,0 +1,518 @@
+"""
+CNT 3-Class Classifier Test Script
+- 금속 (Metal)
+- 반도체 (Semiconductor)  
+- TRASH_combined (TRASH + 혼합 통합)
+
+JASCO V-770 CSV 파일을 읽어서 분류합니다.
+"""
+import numpy as np
+from scipy.interpolate import interp1d
+from pathlib import Path
+from typing import Dict, Tuple, Optional, List
+import csv
+import os
+
+
+# ============================================================
+# JASCO CSV Parser
+# ============================================================
+def parse_jasco_csv(filepath: str) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    """
+    JASCO V-770 CSV 파일 파싱
+    
+    Returns:
+        wavelength (ascending), absorbance, metadata dict
+    """
+    filepath = Path(filepath)
+    metadata = {}
+    wavelengths = []
+    absorbances = []
+    
+    in_data = False
+    
+    with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+        for line in f:
+            line = line.strip()
+            
+            # 데이터 섹션 종료
+            if in_data and (line.startswith('#') or line == '' or not line[0].isdigit()):
+                if line.startswith('#'):
+                    break
+                if line == '':
+                    continue
+                # 숫자가 아닌 줄이면 데이터 끝
+                try:
+                    float(line.split(',')[0])
+                except ValueError:
+                    break
+            
+            # 데이터 섹션 시작
+            if line == 'XYDATA':
+                in_data = True
+                continue
+            
+            if in_data:
+                parts = line.split(',')
+                if len(parts) >= 2:
+                    try:
+                        wl = float(parts[0])
+                        ab = float(parts[1])
+                        wavelengths.append(wl)
+                        absorbances.append(ab)
+                    except ValueError:
+                        continue
+            else:
+                # 메타데이터 파싱
+                parts = line.split(',', 1)
+                if len(parts) == 2:
+                    key = parts[0].strip()
+                    val = parts[1].strip()
+                    metadata[key] = val
+    
+    wavelength = np.array(wavelengths)
+    absorbance = np.array(absorbances)
+    
+    # JASCO는 보통 내림차순 → 오름차순으로 정렬
+    if len(wavelength) > 1 and wavelength[0] > wavelength[-1]:
+        wavelength = wavelength[::-1]
+        absorbance = absorbance[::-1]
+    
+    return wavelength, absorbance, metadata
+
+
+# ============================================================
+# 3-Class CNT Classifier (혼합 → TRASH 통합)
+# ============================================================
+class CNT3ClassClassifier:
+    """
+    3-Class CNT 분류기
+    - 금속 (Metal)
+    - 반도체 (Semiconductor)
+    - TRASH_combined (TRASH + 혼합)
+    """
+    
+    def __init__(self, resolution=3.0, robust_params=None, hierarchical_params=None):
+        self.resolution = resolution
+        
+        # ROBUST 파라미터 (최적화된 값)
+        self.robust_params = robust_params or {
+            'norm_ref_start': 700,
+            'norm_ref_end': 750,
+            'baseline_start': 858,
+            'baseline_end': 930,
+            'target_start': 940,
+            'target_end': 1050,
+            'top_n': 5,
+            'margin': 1.012962962962963
+        }
+        
+        # Hierarchical 파라미터
+        self.hierarchical_params = hierarchical_params or {
+            'metal_peak_threshold': 0.025,
+            'flatness_threshold': 1.05,
+            'diff1_threshold': 0.105,
+            'peak_flat_ratio_max': 1.0,
+            '1160_flat_ratio_max': 1.4,
+            '1210_flat_ratio_max': 1.4,
+            'ratio_min': 0.917,
+            'ratio_max': 1.5,
+            'ratio_norm_min': 0.75,
+            'ratio_norm_max': 1.5,
+            'high_abs_threshold': 0.3,
+            'semi_metal_relative_ratio_min': 1.0,
+            'semi_metal_relative_ratio_max': 2.25,
+        }
+        
+        # 고정 파장 위치
+        self.fixed_wavelengths = {
+            'metal_peaks': [680, 682, 694, 696, 700],
+            'semi_peaks': [952, 954, 957, 995],
+            'flat_region': [850, 870, 890, 910, 930],
+            'peak_950_1100': [969, 970, 1030, 1032],
+            'min_1140': [1147, 1148, 1149],
+            'max_1160_1210': [1158, 1163, 1207, 1210],
+        }
+    
+    def resample_spectrum(self, wavelength, absorbance):
+        """스펙트럼을 3nm 간격으로 리샘플링"""
+        valid = ~np.isnan(wavelength) & ~np.isnan(absorbance)
+        x_raw = wavelength[valid]
+        y_raw = absorbance[valid]
+        
+        if len(x_raw) < 2:
+            return np.array([]), np.array([])
+        
+        new_x = np.arange(400, 1301, self.resolution)
+        f_interp = interp1d(x_raw, y_raw, kind='linear', bounds_error=False, fill_value=np.nan)
+        new_y = f_interp(new_x)
+        
+        valid_mask = ~np.isnan(new_y)
+        return new_x[valid_mask], new_y[valid_mask]
+    
+    def _get_absorbance_at(self, wavelength, absorbance, target_wls, tolerance=5):
+        """특정 파장들에서의 흡광도 값들을 추출"""
+        wl_sorted = sorted(wavelength)
+        abs_dict = dict(zip(wavelength, absorbance))
+        
+        values = []
+        for wl in target_wls:
+            closest = min(wl_sorted, key=lambda x: abs(x - wl))
+            if abs(closest - wl) <= tolerance:
+                val = abs_dict.get(closest, 0.0)
+                if val > 0:
+                    values.append(val)
+        return values
+    
+    def extract_features(self, wavelength, absorbance):
+        """특징 추출"""
+        abs_dict = dict(zip(wavelength, absorbance))
+        wl_sorted = sorted(wavelength)
+        features = {}
+        
+        # 금속 피크 (~680-700nm)
+        metal_vals = self._get_absorbance_at(wavelength, absorbance, 
+                                              self.fixed_wavelengths['metal_peaks'])
+        features['abs_metal'] = max(metal_vals) if metal_vals else 0.0
+        
+        # 반도체 피크 (~950-995nm)
+        semi_vals = self._get_absorbance_at(wavelength, absorbance,
+                                             self.fixed_wavelengths['semi_peaks'])
+        features['abs_semi'] = max(semi_vals) if semi_vals else 0.0
+        
+        # 평탄 구간 (850-930nm)
+        flat_vals = self._get_absorbance_at(wavelength, absorbance,
+                                             self.fixed_wavelengths['flat_region'])
+        if flat_vals:
+            flat_mean = np.mean(flat_vals)
+            flat_std = np.std(flat_vals)
+            features['flat_avg'] = flat_mean
+            features['flatness_score'] = flat_std / (flat_mean + 1e-10)
+        else:
+            features['flat_avg'] = 0.0
+            features['flatness_score'] = 0.0
+        
+        # 950-1100nm 피크
+        peak_vals = self._get_absorbance_at(wavelength, absorbance,
+                                             self.fixed_wavelengths['peak_950_1100'])
+        features['abs_peak'] = max(peak_vals) if peak_vals else 0.0
+        
+        # 1160, 1210nm
+        max_wls = self.fixed_wavelengths['max_1160_1210']
+        v1160 = self._get_absorbance_at(wavelength, absorbance, 
+                                         [w for w in max_wls if 1155 <= w <= 1165])
+        v1210 = self._get_absorbance_at(wavelength, absorbance,
+                                         [w for w in max_wls if 1205 <= w <= 1215])
+        features['abs_1160'] = max(v1160) if v1160 else 0.0
+        features['abs_1210'] = max(v1210) if v1210 else 0.0
+        
+        # 전체 흡광도 수준
+        features['overall_absorbance_level'] = float(np.mean(absorbance))
+        
+        # Min-max 정규화
+        min_val = np.min(absorbance)
+        max_val = np.max(absorbance)
+        rng = max_val - min_val if (max_val - min_val) > 1e-10 else 1e-10
+        norm_abs = (absorbance - min_val) / rng
+        norm_dict = dict(zip(wavelength, norm_abs))
+        
+        # 정규화된 값들
+        metal_norm = self._get_absorbance_at(wavelength, norm_abs, 
+                                              self.fixed_wavelengths['metal_peaks'])
+        features['abs_metal_norm'] = max(metal_norm) if metal_norm else 0.0
+        
+        semi_norm = self._get_absorbance_at(wavelength, norm_abs,
+                                             self.fixed_wavelengths['semi_peaks'])
+        features['abs_semi_norm'] = max(semi_norm) if semi_norm else 0.0
+        
+        flat_norm = self._get_absorbance_at(wavelength, norm_abs,
+                                             self.fixed_wavelengths['flat_region'])
+        features['flat_avg_norm'] = np.mean(flat_norm) if flat_norm else 0.0
+        
+        peak_norm = self._get_absorbance_at(wavelength, norm_abs,
+                                             self.fixed_wavelengths['peak_950_1100'])
+        features['abs_peak_norm'] = max(peak_norm) if peak_norm else 0.0
+        
+        v1160_norm = self._get_absorbance_at(wavelength, norm_abs,
+                                              [w for w in max_wls if 1155 <= w <= 1165])
+        v1210_norm = self._get_absorbance_at(wavelength, norm_abs,
+                                              [w for w in max_wls if 1205 <= w <= 1215])
+        features['abs_1160_norm'] = max(v1160_norm) if v1160_norm else 0.0
+        features['abs_1210_norm'] = max(v1210_norm) if v1210_norm else 0.0
+        
+        # 비율 계산
+        if features['abs_semi'] > 0:
+            features['metal_semi_peak_ratio'] = features['abs_metal'] / features['abs_semi']
+        else:
+            features['metal_semi_peak_ratio'] = float('inf') if features['abs_metal'] > 0 else 0.0
+        
+        if features['abs_semi_norm'] > 1e-10:
+            features['metal_semi_peak_ratio_norm'] = features['abs_metal_norm'] / features['abs_semi_norm']
+        else:
+            features['metal_semi_peak_ratio_norm'] = float('inf') if features['abs_metal_norm'] > 1e-10 else 0.0
+        
+        if features['abs_metal_norm'] > 1e-10 and features['abs_semi_norm'] > 1e-10:
+            features['semi_metal_relative_ratio'] = features['abs_semi_norm'] / features['abs_metal_norm']
+        else:
+            features['semi_metal_relative_ratio'] = 0.0
+        
+        if features['flat_avg_norm'] > 1e-10:
+            features['peak_flat_ratio_norm'] = features['abs_peak_norm'] / features['flat_avg_norm']
+            features['1160_flat_ratio_norm'] = features['abs_1160_norm'] / features['flat_avg_norm']
+            features['1210_flat_ratio_norm'] = features['abs_1210_norm'] / features['flat_avg_norm']
+        else:
+            features['peak_flat_ratio_norm'] = 0.0
+            features['1160_flat_ratio_norm'] = 0.0
+            features['1210_flat_ratio_norm'] = 0.0
+        
+        return features
+    
+    def _classify_robust(self, wavelength, absorbance):
+        """ROBUST 로직: Metal vs TRASH"""
+        try:
+            norm_ref_start = self.robust_params['norm_ref_start']
+            norm_ref_end = self.robust_params['norm_ref_end']
+            
+            mask_ref = (wavelength >= norm_ref_start) & (wavelength <= norm_ref_end)
+            if np.sum(mask_ref) == 0:
+                y_norm = (absorbance - np.min(absorbance)) / (np.max(absorbance) - np.min(absorbance) + 1e-10)
+            else:
+                y_norm = (absorbance - np.min(absorbance)) / (np.max(absorbance[mask_ref]) - np.min(absorbance) + 1e-10)
+            
+            baseline_mask = (wavelength >= self.robust_params['baseline_start']) & \
+                           (wavelength <= self.robust_params['baseline_end'])
+            if np.sum(baseline_mask) == 0:
+                return None
+            baseline_val = np.mean(y_norm[baseline_mask])
+            
+            target_mask = (wavelength >= self.robust_params['target_start']) & \
+                         (wavelength <= self.robust_params['target_end'])
+            if np.sum(target_mask) == 0:
+                return None
+            target_data = y_norm[target_mask]
+            
+            top_n = self.robust_params['top_n']
+            n_top = min(top_n, len(target_data))
+            target_top_mean = np.mean(np.sort(target_data)[-n_top:])
+            
+            margin = self.robust_params['margin']
+            if target_top_mean > (baseline_val * margin):
+                return 'TRASH'
+            else:
+                return 'Metal'
+        except:
+            return None
+    
+    def classify(self, wavelength, absorbance, use_korean=True):
+        """
+        3-class 분류
+        
+        Returns:
+            금속/반도체/TRASH_combined (Korean)
+            Metal/Semiconductor/TRASH (English)
+        """
+        # 1. 리샘플링
+        rs_wl, rs_abs = self.resample_spectrum(
+            np.array(wavelength, dtype=float), 
+            np.array(absorbance, dtype=float)
+        )
+        
+        if len(rs_wl) < 2:
+            return 'TRASH_combined' if use_korean else 'TRASH'
+        
+        # 2. 특징 추출
+        features = self.extract_features(rs_wl, rs_abs)
+        
+        # 3. 반도체 판별 (Mixed 체크 제거 — Semi/Metal/TRASH 단순 분류)
+        hp = self.hierarchical_params
+        smr = features.get('semi_metal_relative_ratio', 0.0)
+        if hp.get('semi_metal_relative_ratio_min', 1.0) <= smr <= hp.get('semi_metal_relative_ratio_max', 2.25):
+            return '반도체' if use_korean else 'Semiconductor'
+        
+        # 5. 금속 기본 조건 체크
+        is_metal = True
+        
+        if features['abs_metal'] <= hp['metal_peak_threshold']:
+            is_metal = False
+        if features['flatness_score'] >= hp['flatness_threshold']:
+            is_metal = False
+        
+        diff1 = features['abs_peak'] - features['flat_avg']
+        if diff1 >= hp['diff1_threshold']:
+            is_metal = False
+        
+        if features.get('peak_flat_ratio_norm', 0) > hp.get('peak_flat_ratio_max', 1.0):
+            is_metal = False
+        if features.get('1160_flat_ratio_norm', 0) > hp.get('1160_flat_ratio_max', 1.4):
+            is_metal = False
+        if features.get('1210_flat_ratio_norm', 0) > hp.get('1210_flat_ratio_max', 1.4):
+            is_metal = False
+        
+        # 6. ROBUST 로직으로 Metal/TRASH 최종 판별
+        robust_result = self._classify_robust(rs_wl, rs_abs)
+        
+        if is_metal:
+            if robust_result == 'TRASH':
+                return 'TRASH_combined' if use_korean else 'TRASH'
+            else:
+                return '금속' if use_korean else 'Metal'
+        else:
+            if robust_result == 'TRASH':
+                return 'TRASH_combined' if use_korean else 'TRASH'
+            elif robust_result == 'Metal':
+                return '금속' if use_korean else 'Metal'
+            else:
+                return 'TRASH_combined' if use_korean else 'TRASH'
+
+
+# ============================================================
+# Batch Test
+# ============================================================
+def batch_classify(data_dir: str, output_csv: str = None):
+    """
+    폴더 내 JASCO CSV 파일들을 일괄 분류
+    
+    Args:
+        data_dir: JASCO CSV 파일이 있는 디렉토리
+        output_csv: 결과 저장 CSV 경로 (None이면 자동 생성)
+    """
+    data_path = Path(data_dir)
+    csv_files = sorted(data_path.glob("*.csv"))
+    
+    if not csv_files:
+        print(f"CSV 파일을 찾을 수 없습니다: {data_dir}")
+        return
+    
+    print(f"발견된 CSV 파일: {len(csv_files)}개")
+    print("=" * 80)
+    
+    # 분류기 생성
+    classifier = CNT3ClassClassifier(resolution=3.0)
+    
+    results = []
+    class_counts = {'금속': 0, '반도체': 0, 'TRASH_combined': 0}
+    
+    for i, csv_file in enumerate(csv_files):
+        try:
+            wavelength, absorbance, metadata = parse_jasco_csv(csv_file)
+            
+            if len(wavelength) < 10:
+                print(f"  [{i+1:3d}] {csv_file.name:40s} → ⚠️  데이터 부족 (skip)")
+                continue
+            
+            label = classifier.classify(wavelength, absorbance, use_korean=True)
+            class_counts[label] += 1
+            
+            # 기본 스펙트럼 정보
+            abs_mean = np.mean(absorbance)
+            abs_max = np.max(absorbance)
+            abs_min = np.min(absorbance)
+            
+            results.append({
+                'filename': csv_file.name,
+                'label': label,
+                'abs_mean': abs_mean,
+                'abs_max': abs_max,
+                'abs_min': abs_min,
+                'n_points': len(wavelength),
+                'wl_range': f"{wavelength[0]:.0f}-{wavelength[-1]:.0f}nm",
+            })
+            
+            # 라벨 색상 표시
+            label_icon = {'금속': '🔵', '반도체': '🟢', 'TRASH_combined': '🔴'}
+            print(f"  [{i+1:3d}] {csv_file.name:40s} → {label_icon.get(label, '⚪')} {label:15s}  "
+                  f"(abs: {abs_mean:.5f}, range: {abs_min:.5f}~{abs_max:.5f})")
+            
+        except Exception as e:
+            print(f"  [{i+1:3d}] {csv_file.name:40s} → ❌ 에러: {e}")
+    
+    # 요약
+    print("\n" + "=" * 80)
+    print("분류 결과 요약")
+    print("=" * 80)
+    total = sum(class_counts.values())
+    for label, count in sorted(class_counts.items()):
+        pct = (count / total * 100) if total > 0 else 0
+        bar = '█' * int(pct / 2)
+        print(f"  {label:15s}: {count:4d} ({pct:5.1f}%) {bar}")
+    print(f"  {'합계':15s}: {total:4d}")
+    
+    # CSV 저장
+    if output_csv is None:
+        output_csv = str(data_path / "classification_results.csv")
+    
+    with open(output_csv, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.DictWriter(f, fieldnames=['filename', 'label', 'abs_mean', 'abs_max', 'abs_min', 'n_points', 'wl_range'])
+        writer.writeheader()
+        writer.writerows(results)
+    
+    print(f"\n결과 저장: {output_csv}")
+    return results
+
+
+def classify_single(filepath: str):
+    """단일 파일 분류 (상세 출력)"""
+    print(f"\n파일: {filepath}")
+    print("-" * 60)
+    
+    wavelength, absorbance, metadata = parse_jasco_csv(filepath)
+    
+    print(f"장비: {metadata.get('Model name', 'Unknown')}")
+    print(f"측정일: {metadata.get('DATE', 'Unknown')}")
+    print(f"데이터 포인트: {len(wavelength)}")
+    print(f"파장 범위: {wavelength[0]:.0f} - {wavelength[-1]:.0f} nm")
+    print(f"흡광도 범위: {np.min(absorbance):.6f} ~ {np.max(absorbance):.6f}")
+    print(f"평균 흡광도: {np.mean(absorbance):.6f}")
+    
+    classifier = CNT3ClassClassifier(resolution=3.0)
+    
+    # 특징 추출도 표시
+    rs_wl, rs_abs = classifier.resample_spectrum(wavelength, absorbance)
+    features = classifier.extract_features(rs_wl, rs_abs)
+    
+    print(f"\n주요 특징:")
+    print(f"  금속 피크 (~700nm):    {features['abs_metal']:.6f}")
+    print(f"  반도체 피크 (~950nm):  {features['abs_semi']:.6f}")
+    print(f"  평탄 구간 (850-930):   {features['flat_avg']:.6f}")
+    print(f"  금속/반도체 비율:      {features['metal_semi_peak_ratio']:.4f}")
+    print(f"  반도체/금속 비율(norm): {features['semi_metal_relative_ratio']:.4f}")
+    print(f"  평탄도 score:          {features['flatness_score']:.6f}")
+    
+    label = classifier.classify(wavelength, absorbance, use_korean=True)
+    label_en = classifier.classify(wavelength, absorbance, use_korean=False)
+    
+    print(f"\n{'='*40}")
+    print(f"  분류 결과: {label} ({label_en})")
+    print(f"{'='*40}")
+    
+    return label
+
+
+# ============================================================
+# Main
+# ============================================================
+if __name__ == "__main__":
+    import sys
+    
+    print("=" * 80)
+    print("CNT 3-Class Classifier (금속 / 반도체 / TRASH)")
+    print("=" * 80)
+    
+    if len(sys.argv) > 1:
+        target = sys.argv[1]
+        
+        if os.path.isdir(target):
+            # 폴더 → 배치 분류
+            batch_classify(target)
+        elif os.path.isfile(target):
+            # 단일 파일 분류
+            classify_single(target)
+        else:
+            print(f"경로를 찾을 수 없습니다: {target}")
+    else:
+        print("\n사용법:")
+        print("  python cnt_3class_test.py <파일경로>      # 단일 파일 분류")
+        print("  python cnt_3class_test.py <폴더경로>      # 폴더 내 일괄 분류")
+        print("\n예시:")
+        print("  python cnt_3class_test.py ./data/2026_02_05-32.csv")
+        print("  python cnt_3class_test.py ./data/")
