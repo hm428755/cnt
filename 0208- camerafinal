@@ -57,10 +57,10 @@ PATTERN_ANGLE_TOLERANCE = 20.0
 
 # --- 하단 도달 판별 (v10 핵심) ---
 # 패턴이 ROI 바닥에서 이 픽셀 이내까지 내려오면 "흡수 완료"
-BOTTOM_MARGIN_PX = 1             # 거의 완전히 바닥까지 (~99%)
+BOTTOM_MARGIN_PX = 3             # ROI 바닥까지 거의 닿아야 (3px 여유)
 
 # --- 이동평균 ---
-MOVING_AVG_SIZE = 7
+MOVING_AVG_SIZE = 5
 
 # --- 파일 ---
 ROI_FILE = 'roi_settings.json'
@@ -68,7 +68,7 @@ BASELINE_FILE = 'baseline_settings.json'
 
 # --- 타이밍 ---
 CHECK_INTERVAL = 0.5
-STABLE_COUNT = 10
+STABLE_COUNT = 8
 
 # ============================================================
 
@@ -286,6 +286,9 @@ def classify_lines_v10(lines, roi_height):
 def analyze_pattern(gray):
     """
     v10: 패턴이 ROI 바닥까지 도달했는지 검출
+    
+    패턴이 ROI 바닥(- margin)까지 닿으면 → 흡수 완료
+    패턴이 위에만 있으면 → 용액 있음
     """
     h, w = gray.shape
     
@@ -312,9 +315,14 @@ def analyze_pattern(gray):
     if lines_raw is None or len(lines_raw) == 0:
         return {
             'absorbed': False,
-            'reach_ratio': 0.0,
             'pattern_count': 0,
+            'pattern_max_y': 0,
+            'smoothed_max_y': get_smoothed_max_y(0),
+            'roi_height': roi_height,
+            'distance_to_bottom': roi_height,
+            'reach_ratio': 0.0,
             'pattern_lines': None,
+            'other_lines': None,
             'angle_mean': 0.0
         }
     
@@ -334,18 +342,25 @@ def analyze_pattern(gray):
     # 이동평균
     smoothed_max_y = get_smoothed_max_y(pattern_max_y)
     
-    # 도달 비율
+    # 바닥까지 거리
+    distance_to_bottom = roi_height - smoothed_max_y
+    
+    # 도달 비율 (패턴이 ROI의 몇 %까지 내려왔는지)
     reach_ratio = smoothed_max_y / roi_height if roi_height > 0 else 0
     
-    # 흡수 완료 판별
-    distance_to_bottom = roi_height - smoothed_max_y
+    # 흡수 완료 판별: 패턴이 바닥에서 BOTTOM_MARGIN_PX 이내까지 도달
     absorbed = distance_to_bottom <= BOTTOM_MARGIN_PX
     
     return {
         'absorbed': absorbed,
-        'reach_ratio': reach_ratio,
         'pattern_count': pattern_count,
+        'pattern_max_y': pattern_max_y,
+        'smoothed_max_y': smoothed_max_y,
+        'roi_height': roi_height,
+        'distance_to_bottom': distance_to_bottom,
+        'reach_ratio': reach_ratio,
         'pattern_lines': pattern_lines,
+        'other_lines': other_lines,
         'angle_mean': angle_mean
     }
 
@@ -362,11 +377,11 @@ def beep_alert():
 # ============================================================
 
 def classify_state(metrics):
-    """흡수 완료 vs 흡수중"""
+    """흡수 완료 vs 용액 있음"""
     if metrics['absorbed']:
         return "흡수 완료", (0, 255, 0), 'absorbed'
     else:
-        return "계면활성제 흡수중", (0, 255, 255), 'liquid'
+        return "용액 있음", (0, 255, 255), 'liquid'
 
 
 # ============================================================
@@ -374,7 +389,7 @@ def classify_state(metrics):
 # ============================================================
 
 def draw_lines_v10(display, metrics, roi):
-    """패턴 직선 그리기"""
+    """직선 그리기 (ROI 바닥 = 도달 기준)"""
     x1_roi, y1_roi, x2_roi, y2_roi = roi
     offset_x = x1_roi + ROI_MARGIN
     offset_y = y1_roi + ROI_MARGIN
@@ -387,6 +402,15 @@ def draw_lines_v10(display, metrics, roi):
                      (offset_x + lx1, offset_y + ly1), 
                      (offset_x + lx2, offset_y + ly2), 
                      (0, 255, 0), 2)
+    
+    # 기타 직선 (회색)
+    if metrics['other_lines'] is not None:
+        for line in metrics['other_lines']:
+            lx1, ly1, lx2, ly2 = line[0]
+            cv2.line(display, 
+                     (offset_x + lx1, offset_y + ly1), 
+                     (offset_x + lx2, offset_y + ly2), 
+                     (128, 128, 128), 1)
 
 
 def draw_reach_bar(display, reach_ratio, absorbed, x, y, width=150, height=20):
@@ -471,7 +495,7 @@ def select_roi():
             
             status = "흡수완료" if m['absorbed'] else "용액있음"
             color = (0, 255, 0) if m['absorbed'] else (0, 255, 255)
-            put_korean_text(display, f"{status} | 도달:{m['reach_ratio']*100:.0f}%", 
+            put_korean_text(display, f"{status} | 도달:{m['reach_ratio']*100:.0f}% 거리:{m['distance_to_bottom']:.0f}px", 
                            (x1, y1 - 25), FONT_SMALL, color)
         
         cv2.imshow("Select ROI", display)
@@ -582,7 +606,7 @@ def calibrate():
         # 정보
         put_korean_text(display, status, (10, 10), FONT_LARGE, color)
         put_korean_text(display, 
-                        f"도달: {m['reach_ratio']*100:.0f}% | 기준각도: {BASELINE_ANGLE:.1f}°",
+                        f"바닥까지: {m['distance_to_bottom']:.0f}px | 도달: {m['reach_ratio']*100:.0f}% | 기준: {BASELINE_ANGLE:.1f}°",
                         (10, 50), FONT_MEDIUM, (255, 255, 0))
         
         draw_reach_bar(display, m['reach_ratio'], m['absorbed'], 10, 80, 150, 15)
@@ -607,12 +631,12 @@ def calibrate():
                 print("\n패턴 직선 부족!")
         
         elif key == ord('1'):
-            vals['1'] = f"흡수중: 도달 {m['reach_ratio']*100:.0f}%"
-            print(f"[1] 흡수중: 도달 {m['reach_ratio']*100:.0f}%")
+            vals['1'] = f"용액: 거리 {m['distance_to_bottom']:.0f}px, 도달 {m['reach_ratio']*100:.0f}%"
+            print(f"[1] 용액: 거리 {m['distance_to_bottom']:.0f}px, 도달 {m['reach_ratio']*100:.0f}%")
         
         elif key == ord('2'):
-            vals['2'] = f"흡수완료: 도달 {m['reach_ratio']*100:.0f}%"
-            print(f"[2] 흡수완료: 도달 {m['reach_ratio']*100:.0f}%")
+            vals['2'] = f"흡수: 거리 {m['distance_to_bottom']:.0f}px, 도달 {m['reach_ratio']*100:.0f}%"
+            print(f"[2] 흡수: 거리 {m['distance_to_bottom']:.0f}px, 도달 {m['reach_ratio']*100:.0f}%")
         
         elif key == ord('q') or key == ord('Q'):
             break
@@ -659,7 +683,7 @@ def monitor():
         cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
         draw_lines_v10(display, m, roi)
         
-        put_korean_text(display, f"{status} | 도달:{m['reach_ratio']*100:.0f}%",
+        put_korean_text(display, f"{status} | 도달:{m['reach_ratio']*100:.0f}% 거리:{m['distance_to_bottom']:.0f}px",
                         (10, 10), FONT_LARGE, color)
         
         cv2.imshow("Monitor", display)
@@ -718,7 +742,7 @@ def absorption_test():
                 state = 'wait_absorb'
                 stable_counter = 0
             
-            status = f"[대기] 도달:{m['reach_ratio']*100:.0f}%"
+            status = f"[대기] 거리:{m['distance_to_bottom']:.0f}px"
             color = (255, 255, 0)
             instruction = ">>> 용액을 넣으세요 <<<"
         
@@ -734,7 +758,7 @@ def absorption_test():
                 print("\n흡수 완료!")
                 break
             
-            status = f"[흡수중] 도달:{m['reach_ratio']*100:.0f}%"
+            status = f"[흡수중] 거리:{m['distance_to_bottom']:.0f}px ({m['reach_ratio']*100:.0f}%)"
             color = (0, 255, 255)
             instruction = "흡수 중..."
         
@@ -789,7 +813,7 @@ def wait_for_absorbed(timeout=300):
         
         elapsed = time.time() - start_time
         status = "흡수" if m['absorbed'] else "용액"
-        print(f"\r   {elapsed:.0f}초 | {status} | 도달:{m['reach_ratio']*100:.0f}% | {stable_counter}/{STABLE_COUNT}",
+        print(f"\r   {elapsed:.0f}초 | {status} | 거리:{m['distance_to_bottom']:.0f}px 도달:{m['reach_ratio']*100:.0f}% | {stable_counter}/{STABLE_COUNT}",
               end='', flush=True)
         
         if stable_counter >= STABLE_COUNT:
@@ -835,7 +859,7 @@ def wait_for_liquid(timeout=60):
         
         elapsed = time.time() - start_time
         status = "용액" if not m['absorbed'] else "빈"
-        print(f"\r   {elapsed:.0f}초 | {status} | 도달:{m['reach_ratio']*100:.0f}% | {stable_counter}/{STABLE_COUNT}",
+        print(f"\r   {elapsed:.0f}초 | {status} | 거리:{m['distance_to_bottom']:.0f}px | {stable_counter}/{STABLE_COUNT}",
               end='', flush=True)
         
         if stable_counter >= STABLE_COUNT:
