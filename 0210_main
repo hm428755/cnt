@@ -1,0 +1,329 @@
+"""
+CNT 크로마토그래피 전체 자동화
+
+흐름:
+1. 컨디셔닝 400ml 주입 (순환펌프)
+2. 컨디셔닝 흡수 완료 감지
+3. [CNT 10ml → 일루션 50ml → 흡수 감지] × 5회
+4. 완료
+"""
+
+import cv2
+import time
+
+from devices.pump import Pump
+from devices.valve import Valve
+from config import *
+
+from pattern_refraction_v10 import (
+    load_roi,
+    load_baseline,
+    reset_buffers,
+    init_camera,
+    read_frame,
+    analyze_pattern,
+    draw_lines_v10,
+    put_korean_text,
+    classify_state,
+    beep_alert,
+    draw_reach_bar,
+    wait_for_absorbed_with_display,
+    FONT_LARGE, FONT_MEDIUM, FONT_SMALL,
+    STABLE_COUNT,
+)
+
+
+def inject_with_display(cap, roi, pump, volume, flow_rate, phase_name):
+    """펌프 주입하면서 카메라 화면 표시"""
+    x1, y1, x2, y2 = roi
+    injection_time_sec = volume / flow_rate * 60
+    
+    print(f"\n  펌프 시작: {flow_rate} ml/min ({injection_time_sec:.0f}초)")
+    pump.run_continuous(flow_rate)
+    
+    injection_start = time.time()
+    reset_buffers()
+    
+    while True:
+        ret, frame = read_frame(cap)
+        if not ret:
+            continue
+        
+        roi_frame = frame[y1:y2, x1:x2]
+        gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+        m = analyze_pattern(gray)
+        
+        elapsed = time.time() - injection_start
+        remaining = injection_time_sec - elapsed
+        injected_ml = (elapsed / 60) * flow_rate
+        progress = min(elapsed / injection_time_sec, 1.0)
+        
+        display = frame.copy()
+        
+        status, status_color, _ = classify_state(m)
+        
+        cv2.rectangle(display, (x1, y1), (x2, y2), status_color, 2)
+        draw_lines_v10(display, m, roi)
+        
+        put_korean_text(display, phase_name, (10, 10), FONT_LARGE, (0, 255, 255))
+        put_korean_text(display, f"{status} | 도달: {m['reach_ratio']*100:.0f}%", (10, 50), FONT_MEDIUM, status_color)
+        put_korean_text(display, f"주입: {injected_ml:.1f}/{volume}ml ({progress*100:.0f}%)", (10, 85), FONT_MEDIUM, (255, 255, 0))
+        put_korean_text(display, f"남은 시간: {remaining:.0f}초", (10, 120), FONT_SMALL, (200, 200, 200))
+        
+        # 진행 막대
+        bar_y = 150
+        cv2.rectangle(display, (10, bar_y), (210, bar_y + 20), (50, 50, 50), -1)
+        fill_w = int(200 * progress)
+        cv2.rectangle(display, (10, bar_y), (10 + fill_w, bar_y + 20), (0, 255, 255), -1)
+        cv2.rectangle(display, (10, bar_y), (210, bar_y + 20), (200, 200, 200), 1)
+        
+        cv2.imshow("CNT Automation", display)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            pump.stop()
+            return 'quit'
+        
+        if elapsed >= injection_time_sec:
+            break
+    
+    pump.stop()
+    beep_alert()
+    print(f"OK {volume}ml 주입 완료!")
+    return 'done'
+
+
+def main():
+    print("\n" + "=" * 60)
+    print("  CNT 크로마토그래피 전체 자동화")
+    print("=" * 60)
+    print(f"""
+  컨디셔닝: {CONDITIONING_VOLUME}ml @ {CONDITIONING_FLOW_RATE}ml/min
+  CNT: {CNT_VOLUME}ml @ {CNT_FLOW_RATE}ml/min
+  일루션: {ELUTION_VOLUME}ml @ {ELUTION_FLOW_RATE}ml/min
+  반복: {CNT_ELUTION_CYCLES}회
+""")
+    
+    # ─────────────────────────────────────
+    # 장비 연결
+    # ─────────────────────────────────────
+    
+    roi = load_roi()
+    if not roi:
+        print("X ROI 없음! pattern_refraction_v10.py에서 먼저 설정하세요.")
+        return
+    load_baseline()
+    
+    cap = init_camera()
+    if not cap:
+        print("X 카메라 실패!")
+        return
+    
+    x1, y1, x2, y2 = roi
+    print(f"OK 카메라 연결됨")
+    
+    # 순환 펌프 (컨디셔닝)
+    try:
+        pump_circ = Pump(**PUMP_CIRCULATION, baudrate=BAUDRATE, rev_per_ml=REV_PER_ML)
+        pump_circ.connect()
+        print("OK 순환 펌프 연결됨")
+    except Exception as e:
+        print(f"X 순환 펌프 실패: {e}")
+        cap.release()
+        return
+    
+    # 주입 펌프 (CNT, 일루션)
+    try:
+        pump_inj = Pump(**PUMP_INJECTION, baudrate=BAUDRATE, rev_per_ml=REV_PER_ML)
+        pump_inj.connect()
+        print("OK 주입 펌프 연결됨")
+    except Exception as e:
+        print(f"X 주입 펌프 실패: {e}")
+        pump_circ.disconnect()
+        cap.release()
+        return
+    
+    # 밸브
+    valve = Valve(port=VALVE_PORT, baudrate=VALVE_BAUDRATE)
+    valve_ok = valve.connect()
+    if valve_ok:
+        print("OK 밸브 연결됨")
+    else:
+        print("! 밸브 실패 - 수동 전환 필요")
+    
+    print("\n[조작] Q=종료  S=건너뛰기")
+    
+    reset_buffers()
+    
+    try:
+        # ═══════════════════════════════════════════════════════
+        # Phase A: 컨디셔닝
+        # ═══════════════════════════════════════════════════════
+        
+        print("\n" + "=" * 60)
+        print("  Phase A: 컨디셔닝 주입")
+        print("=" * 60)
+        
+        input("\n▶ 시작하려면 [Enter]...")
+        
+        result = inject_with_display(cap, roi, pump_circ, CONDITIONING_VOLUME, CONDITIONING_FLOW_RATE, "Phase A: 컨디셔닝 주입")
+        
+        if result == 'quit':
+            raise KeyboardInterrupt
+        
+        # ─────────────────────────────────────
+        # 컨디셔닝 흡수 대기
+        # ─────────────────────────────────────
+        
+        print("\n" + "-" * 60)
+        print("  컨디셔닝 흡수 대기")
+        print("-" * 60)
+        
+        result = wait_for_absorbed_with_display(cap, roi, TIMEOUT_CONDITIONING, "컨디셔닝 흡수 대기")
+        
+        if result == 'quit':
+            raise KeyboardInterrupt
+        elif result == 'timeout':
+            print("\n! 타임아웃!")
+            choice = input("계속? (y/n): ").strip().lower()
+            if choice != 'y':
+                raise KeyboardInterrupt
+        
+        print("\nOK 컨디셔닝 완료!")
+        beep_alert()
+        
+        # ═══════════════════════════════════════════════════════
+        # Phase B: CNT/일루션 반복
+        # ═══════════════════════════════════════════════════════
+        
+        for cycle in range(1, CNT_ELUTION_CYCLES + 1):
+            print("\n" + "=" * 60)
+            print(f"  Cycle {cycle}/{CNT_ELUTION_CYCLES}")
+            print("=" * 60)
+            
+            # ─────────────────────────────────────
+            # 밸브 → CNT
+            # ─────────────────────────────────────
+            
+            print(f"\n  [{cycle}] 밸브 → CNT")
+            
+            if valve_ok:
+                valve.to_air()
+                print("  OK 밸브 → CNT")
+            else:
+                input("  ▶ 밸브를 CNT로 전환하고 [Enter]...")
+            
+            time.sleep(0.5)
+            
+            # ─────────────────────────────────────
+            # CNT 주입
+            # ─────────────────────────────────────
+            
+            print(f"\n  [{cycle}] CNT {CNT_VOLUME}ml 주입")
+            
+            result = inject_with_display(cap, roi, pump_inj, CNT_VOLUME, CNT_FLOW_RATE, f"Cycle {cycle}: CNT 주입")
+            
+            if result == 'quit':
+                raise KeyboardInterrupt
+            
+            # ─────────────────────────────────────
+            # 밸브 → 일루션
+            # ─────────────────────────────────────
+            
+            print(f"\n  [{cycle}] 밸브 → 일루션")
+            
+            if valve_ok:
+                valve.to_solution()
+                print("  OK 밸브 → 일루션")
+            else:
+                input("  ▶ 밸브를 일루션으로 전환하고 [Enter]...")
+            
+            time.sleep(0.5)
+            
+            # ─────────────────────────────────────
+            # 일루션 주입
+            # ─────────────────────────────────────
+            
+            print(f"\n  [{cycle}] 일루션 {ELUTION_VOLUME}ml 주입")
+            
+            result = inject_with_display(cap, roi, pump_inj, ELUTION_VOLUME, ELUTION_FLOW_RATE, f"Cycle {cycle}: 일루션 주입")
+            
+            if result == 'quit':
+                raise KeyboardInterrupt
+            
+            # ─────────────────────────────────────
+            # 일루션 흡수 대기
+            # ─────────────────────────────────────
+            
+            print(f"\n  [{cycle}] 일루션 흡수 대기")
+            
+            result = wait_for_absorbed_with_display(cap, roi, TIMEOUT_ELUTION, f"Cycle {cycle}: 일루션 흡수 대기")
+            
+            if result == 'quit':
+                raise KeyboardInterrupt
+            elif result == 'timeout':
+                print("\n  ! 타임아웃!")
+                choice = input("  계속? (y/n): ").strip().lower()
+                if choice != 'y':
+                    raise KeyboardInterrupt
+            
+            print(f"\n  OK Cycle {cycle} 완료!")
+            beep_alert()
+        
+        # ═══════════════════════════════════════════════════════
+        # 완료
+        # ═══════════════════════════════════════════════════════
+        
+        print("\n" + "=" * 60)
+        print("  ★★★ 전체 자동화 완료! ★★★")
+        print("=" * 60)
+        
+        beep_alert()
+        time.sleep(0.3)
+        beep_alert()
+        time.sleep(0.3)
+        beep_alert()
+        
+        # 결과 표시 (10초)
+        monitor_start = time.time()
+        while time.time() - monitor_start < 10:
+            ret, frame = read_frame(cap)
+            if not ret:
+                continue
+            
+            roi_frame = frame[y1:y2, x1:x2]
+            gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+            m = analyze_pattern(gray)
+            
+            display = frame.copy()
+            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            draw_lines_v10(display, m, roi)
+            
+            remaining = 10 - (time.time() - monitor_start)
+            put_korean_text(display, f"전체 완료! ({remaining:.0f}초)", (10, 10), FONT_LARGE, (0, 255, 0))
+            put_korean_text(display, f"컨디셔닝 {CONDITIONING_VOLUME}ml + CNT/일루션 {CNT_ELUTION_CYCLES}회", (10, 50), FONT_MEDIUM, (255, 255, 255))
+            
+            cv2.imshow("CNT Automation", display)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        
+    except KeyboardInterrupt:
+        print("\n\n긴급 중단!")
+        pump_circ.stop()
+        pump_inj.stop()
+        
+    finally:
+        pump_circ.stop()
+        pump_inj.stop()
+        pump_circ.disconnect()
+        pump_inj.disconnect()
+        if valve_ok:
+            valve.disconnect()
+        cap.release()
+        cv2.destroyAllWindows()
+        print("\n장비 연결 해제")
+
+
+if __name__ == "__main__":
+    main()
