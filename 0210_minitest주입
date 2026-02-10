@@ -183,7 +183,7 @@ def main():
         print("=" * 55)
         
         if valve_ok:
-            valve.to_air()  # CNT 방향
+            valve.to_solution()  # CNT = 아래
             print("OK 밸브 → CNT")
         else:
             input("▶ 밸브를 CNT로 전환하고 [Enter]...")
@@ -212,7 +212,7 @@ def main():
         print("=" * 55)
         
         if valve_ok:
-            valve.to_solution()  # 일루션 방향
+            valve.to_air()  # 일루션 = 위
             print("OK 밸브 → 일루션")
         else:
             input("▶ 밸브를 일루션으로 전환하고 [Enter]...")
