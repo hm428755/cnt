@@ -9,7 +9,7 @@ CNT 크로마토그래피 통합 실험 시스템 (OOP)
 변경사항:
 - 밸브: CNT = to_solution() (2번), 일루션 = to_air() (1번)
 - CNT 주입 후 바로 일루션 (CNT 흡수 대기 없음)
-- 흡수 완료 후 1분 대기 추가
+- 흡수 완료 후 ABSORPTION_DELAY초 대기 추가
 """
 
 import time
@@ -59,7 +59,8 @@ class DeviceManager:
 
         # 주입 펌프
         self.pump_inj = Pump(
-            **PUMP_INJECTION,
+            port=PUMP_INJECTION["port"],
+            address=PUMP_INJECTION["slave_id"],
             baudrate=BAUDRATE,
             rev_per_ml=REV_PER_ML,
         )
@@ -68,7 +69,8 @@ class DeviceManager:
 
         # 순환 펌프
         self.pump_circ = Pump(
-            **PUMP_CIRCULATION,
+            port=PUMP_CIRCULATION["port"],
+            address=PUMP_CIRCULATION["slave_id"],
             baudrate=BAUDRATE,
             rev_per_ml=REV_PER_ML,
         )
@@ -250,7 +252,7 @@ class DeviceManager:
 # ================================================================
 
 def run_conditioning(dm: DeviceManager):
-    """컨디셔닝: 400ml"""
+    """컨디셔닝"""
     print("\n" + "=" * 55)
     print("  Phase 1: 컨디셔닝")
     print(f"  {CONDITIONING_VOLUME}ml @ {CONDITIONING_FLOW_RATE} ml/min")
@@ -267,17 +269,17 @@ def run_conditioning(dm: DeviceManager):
 
     print("\n  ✓ 컨디셔닝 주입 완료!")
 
-    # 카메라로 흡수 감지 + 1분 대기
+    # 카메라로 흡수 감지 + 대기
     dm.wait_absorption("컨디셔닝", TIMEOUT_CONDITIONING, delay_after=ABSORPTION_DELAY)
 
 
 def run_cnt_sample(dm: DeviceManager, cycle: int, start_circulation: bool = False):
-    """CNT 샘플: 10ml @ 3.3ml/min → 바로 일루션"""
+    """CNT 샘플 → 바로 일루션 (흡수 대기 없음)"""
     print(f"\n  ─────────────────────────────────")
     print(f"  [CNT 샘플] {SAMPLE_VOLUME}ml @ {SAMPLE_FLOW_RATE} ml/min")
     print(f"  ─────────────────────────────────")
 
-    # 밸브 → CNT
+    # 밸브 → CNT (2번)
     dm.valve_to_cnt()
 
     if start_circulation:
@@ -294,19 +296,19 @@ def run_cnt_sample(dm: DeviceManager, cycle: int, start_circulation: bool = Fals
 
 
 def run_elution(dm: DeviceManager, cycle: int):
-    """일루션: 50ml @ 20ml/min"""
+    """일루션"""
     print(f"\n  ─────────────────────────────────")
     print(f"  [일루션] {ELUTION_VOLUME}ml @ {ELUTION_FLOW_RATE} ml/min")
     print(f"  ─────────────────────────────────")
 
-    # 밸브 → 일루션
+    # 밸브 → 일루션 (1번)
     dm.valve_to_elution()
 
     dm.inject_volume(ELUTION_VOLUME, ELUTION_FLOW_RATE)
 
     print("\n  ✓ 일루션 주입 완료!")
 
-    # 카메라로 흡수 감지 + 1분 대기
+    # 카메라로 흡수 감지 + 대기
     dm.wait_absorption("일루션", TIMEOUT_ELUTION, delay_after=ABSORPTION_DELAY)
 
 
@@ -362,8 +364,8 @@ def main():
     status = dm.connect_all()
 
     print(f"\n[장비 연결]")
-    print(f"  펌프(주입): ✓")
-    print(f"  펌프(순환): ✓")
+    print(f"  펌프(주입): ✓ ({PUMP_INJECTION['name']})")
+    print(f"  펌프(순환): ✓ ({PUMP_CIRCULATION['name']})")
     print(f"  밸브: {'✓' if status['valve'] else '✗'}")
     print(f"  Gilson: {'✓' if status['gilson'] else '✗'}")
     print(f"  Jasco: {'✓' if status['jasco'] else '✗'}")
