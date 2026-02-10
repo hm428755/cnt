@@ -121,9 +121,14 @@ def main():
     
     # 펌프
     try:
-        pump = Pump(**PUMP_INJECTION, baudrate=BAUDRATE, rev_per_ml=REV_PER_ML)
+        pump = Pump(
+            port=PUMP_INJECTION["port"],
+            address=PUMP_INJECTION["slave_id"],
+            baudrate=BAUDRATE,
+            rev_per_ml=REV_PER_ML,
+        )
         pump.connect()
-        print("OK 펌프 연결됨")
+        print(f"OK 펌프 연결됨 ({PUMP_INJECTION['name']})")
     except Exception as e:
         print(f"X 펌프 실패: {e}")
         cap.release()
