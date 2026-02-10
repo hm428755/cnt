@@ -1,0 +1,141 @@
+"""
+실험 설정 파일 - 여기만 수정하세요!
+전체 시스템: 펌프 + Gilson FC-203B + Jasco UV-Vis
+"""
+
+# ================================================================
+#                    테스트 모드
+# ================================================================
+
+TEST_MODE = True   # True: 소량/단시간 테스트, False: 실제 실험
+
+
+# ================================================================
+#                    펌프 설정
+# ================================================================
+
+PUMP_CIRCULATION = {
+    "port": "COM4",
+    "slave_id": 3,
+    "name": "순환펌프"
+}
+
+PUMP_INJECTION = {
+    "port": "COM3",
+    "slave_id": 2,
+    "name": "주입펌프"
+}
+
+BAUDRATE = 9600
+
+# 캘리브레이션 (실측값)
+REV_PER_ML = 12.54    # 0.13 ml/min = 1.63 RPM 기준
+
+
+# ================================================================
+#                    Gilson FC-203B 설정
+# ================================================================
+
+GILSON_PORT = "COM5"
+GILSON_UNIT_ID = 6
+
+# 튜브 위치 (3-class 분류)
+TUBE_METAL = 25           # 금속 CNT
+TUBE_SEMICONDUCTOR = 65   # 반도체 CNT
+# 폐기는 drain (V1) 사용
+
+
+# ================================================================
+#                    솔레노이드 밸브 설정 (Arduino)
+# ================================================================
+
+VALVE_PORT = "COM6"       # Arduino COM 포트
+VALVE_BAUDRATE = 9600
+
+# 밸브 방향:
+#   CNT = to_solution() = 2번 (아래)
+#   일루션 = to_air() = 1번 (위)
+
+
+# ================================================================
+#                    Jasco UV-Vis 설정
+# ================================================================
+
+# Spectra Manager 창 제목
+JASCO_WINDOW_TITLE = "Spectra Measurement"
+
+# CSV 감시/저장 경로
+JASCO_WATCH_DIR = r"C:\Users\Nagroup\Documents"
+JASCO_OUTPUT_DIR = r"C:\Users\Nagroup\Desktop\0202_cnt\UV_vis"
+
+# 이미지 매칭 신뢰도 (0.0 ~ 1.0)
+JASCO_CONFIDENCE = 0.7
+
+# 상태 체크 간격 (초)
+JASCO_CHECK_INTERVAL = 2.0
+
+
+# ================================================================
+#                    실험 파라미터
+# ================================================================
+
+if TEST_MODE:
+    # ────────────────────────────────────
+    # 테스트용 (소량, 빠르게)
+    # ────────────────────────────────────
+    CONDITIONING_VOLUME = 0.1       # ml
+    CONDITIONING_FLOW_RATE = 0.5    # ml/min
+    
+    SLOW_FLOW_RATE = 0.13           # ml/min (순환펌프)
+    
+    SAMPLE_VOLUME = 0.1             # ml
+    SAMPLE_FLOW_RATE = 0.8          # ml/min
+    CNT_VOLUME = 0.1                # ml (별칭)
+    CNT_FLOW_RATE = 0.8             # ml/min (별칭)
+    
+    ELUTION_VOLUME = 0.1            # ml
+    ELUTION_FLOW_RATE = 0.8         # ml/min
+    
+    NUM_CYCLES = 2                  # 2회만
+    UV_TO_GILSON_DELAY = 5          # 5초
+    
+    # 타임아웃 (초)
+    TIMEOUT_CONDITIONING = 60       # 1분
+    TIMEOUT_ELUTION = 60            # 1분
+    
+    # 흡수 완료 후 대기
+    ABSORPTION_DELAY = 10           # 10초
+
+else:
+    # ────────────────────────────────────
+    # 실제 실험
+    # ────────────────────────────────────
+    CONDITIONING_VOLUME = 400       # ml
+    CONDITIONING_FLOW_RATE = 20     # ml/min (약 20분)
+    
+    SLOW_FLOW_RATE = 0.13           # ml/min (순환펌프)
+    
+    SAMPLE_VOLUME = 10              # ml
+    SAMPLE_FLOW_RATE = 3.3          # ml/min (약 3분)
+    CNT_VOLUME = 10                 # ml (별칭)
+    CNT_FLOW_RATE = 3.3             # ml/min (별칭)
+    
+    ELUTION_VOLUME = 50             # ml
+    ELUTION_FLOW_RATE = 20          # ml/min (약 2.5분)
+    
+    NUM_CYCLES = 5                  # 5회 반복
+    UV_TO_GILSON_DELAY = 608        # TODO: 실측값으로 수정
+    
+    # 타임아웃 (초)
+    TIMEOUT_CONDITIONING = 1800     # 30분
+    TIMEOUT_ELUTION = 900           # 15분
+    
+    # 흡수 완료 후 대기
+    ABSORPTION_DELAY = 60           # 1분
+
+
+# ================================================================
+#                    카메라 설정
+# ================================================================
+
+CAMERA_INDEX = 1
