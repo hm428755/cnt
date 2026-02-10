@@ -9,6 +9,10 @@
 
 TEST_MODE = True   # True: 소량/단시간 테스트, False: 실제 실험
 
+# Slack 알림 설정
+SLACK_BOT_TOKEN = ""  # Bot Token
+SLACK_USER_ID = ""             # 본인 Member ID
+
 
 # ================================================================
 #                    펌프 설정
@@ -29,6 +33,7 @@ PUMP_INJECTION = {
 BAUDRATE = 9600
 
 # 캘리브레이션 (실측값)
+# None이면 펌프에서 자동 읽기, 수동 지정하려면 숫자 입력
 REV_PER_ML = 12.54    # 0.13 ml/min = 1.63 RPM 기준
 
 
@@ -49,7 +54,7 @@ TUBE_SEMICONDUCTOR = 65   # 반도체 CNT
 #                    솔레노이드 밸브 설정 (Arduino)
 # ================================================================
 
-VALVE_PORT = "COM6"       # Arduino COM 포트
+VALVE_PORT = "COM6"       # Arduino COM 포트 (장치관리자에서 확인!)
 VALVE_BAUDRATE = 9600
 
 # 밸브 방향:
@@ -80,9 +85,7 @@ JASCO_CHECK_INTERVAL = 2.0
 # ================================================================
 
 if TEST_MODE:
-    # ────────────────────────────────────
     # 테스트용 (소량, 빠르게)
-    # ────────────────────────────────────
     CONDITIONING_VOLUME = 0.1       # ml
     CONDITIONING_FLOW_RATE = 0.5    # ml/min
     
@@ -99,7 +102,7 @@ if TEST_MODE:
     NUM_CYCLES = 2                  # 2회만
     UV_TO_GILSON_DELAY = 5          # 5초
     
-    # 타임아웃 (초)
+    # 카메라 흡수 감지 타임아웃 (초)
     TIMEOUT_CONDITIONING = 60       # 1분
     TIMEOUT_ELUTION = 60            # 1분
     
@@ -107,9 +110,7 @@ if TEST_MODE:
     ABSORPTION_DELAY = 10           # 10초
 
 else:
-    # ────────────────────────────────────
     # 실제 실험
-    # ────────────────────────────────────
     CONDITIONING_VOLUME = 400       # ml
     CONDITIONING_FLOW_RATE = 20     # ml/min (약 20분)
     
@@ -126,12 +127,12 @@ else:
     NUM_CYCLES = 5                  # 5회 반복
     UV_TO_GILSON_DELAY = 608        # TODO: 실측값으로 수정
     
-    # 타임아웃 (초)
+    # 카메라 흡수 감지 타임아웃 (초)
     TIMEOUT_CONDITIONING = 1800     # 30분
     TIMEOUT_ELUTION = 900           # 15분
     
     # 흡수 완료 후 대기
-    ABSORPTION_DELAY = 60           # 1분
+    ABSORPTION_DELAY = 60           # 1분 (60초)
 
 
 # ================================================================
