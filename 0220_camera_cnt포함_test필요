@@ -1,0 +1,788 @@
+"""
+CNT 분리 자동화 v11 - 투명/CNT 4상태 감지
+
+감지 원리:
+  투명 용액: 패턴 보임 + 굴절 (reach_ratio 낮음)
+  CNT 용액:  패턴 안 보임 (직선 없음 or 밝기 낮음)
+  흡수 완료: 대각선 패턴이 ROI 바닥에 닿음 (둘 다 동일)
+
+4상태 흐름:
+  1. 투명 넣기 대기 → 패턴 굴절 감지 → 확인!
+  2. 투명 흡수 대기 → 패턴 바닥 도달 → 완료!
+  3. CNT 넣기 대기  → 패턴 안 보임 → 확인!
+  4. CNT 흡수 대기  → 패턴 바닥 도달 → 완료! → 1번으로
+"""
+
+import cv2
+import numpy as np
+import time
+import json
+import os
+import winsound
+from collections import deque
+from PIL import ImageFont, ImageDraw, Image
+
+
+# ============================================================
+#                    [설정]
+# ============================================================
+
+CAMERA_INDEX = 1
+
+ANTI_FLICKER = True
+FRAME_AVG_COUNT = 5
+
+BLUR_KERNEL = 3
+ROI_MARGIN = 5
+
+CANNY_LOW = 50
+CANNY_HIGH = 150
+HOUGH_THRESHOLD = 25
+MIN_LINE_LENGTH = 20
+MAX_LINE_GAP = 10
+
+BASELINE_ANGLE = 54.2
+PATTERN_ANGLE_TOLERANCE = 20.0
+BOTTOM_MARGIN_PX = 3
+
+MOVING_AVG_SIZE = 5
+
+# --- CNT 감지용 threshold ---
+CNT_BRIGHTNESS_THRESHOLD = 80    # 이 밝기 이하면 CNT
+CNT_MIN_PATTERN_COUNT = 3        # 이 개수 미만이면 CNT (패턴 안 보임)
+
+# --- 투명 용액 감지용 ---
+LIQUID_REACH_THRESHOLD = 0.5     # reach_ratio가 이 이하면 용액 있음
+
+ROI_FILE = 'roi_settings.json'
+BASELINE_FILE = 'baseline_settings.json'
+
+CHECK_INTERVAL = 0.5
+STABLE_COUNT = 8
+
+
+# ============================================================
+#  기준 각도 저장/로드
+# ============================================================
+
+def save_baseline(angle):
+    with open(BASELINE_FILE, 'w') as f:
+        json.dump({'baseline_angle': angle}, f)
+    print(f"기준 각도 저장: {angle:.1f}°")
+
+def load_baseline():
+    global BASELINE_ANGLE
+    if os.path.exists(BASELINE_FILE):
+        with open(BASELINE_FILE, 'r') as f:
+            data = json.load(f)
+            BASELINE_ANGLE = data.get('baseline_angle', 54.2)
+            print(f"기준 각도 로드: {BASELINE_ANGLE:.1f}°")
+    return BASELINE_ANGLE
+
+
+# ============================================================
+#  이동평균
+# ============================================================
+max_y_buffer = deque(maxlen=MOVING_AVG_SIZE)
+brightness_buffer = deque(maxlen=MOVING_AVG_SIZE)
+
+def get_smoothed_max_y(max_y):
+    max_y_buffer.append(max_y)
+    return float(np.mean(max_y_buffer)) if max_y_buffer else max_y
+
+def get_smoothed_brightness(brightness):
+    brightness_buffer.append(brightness)
+    return float(np.mean(brightness_buffer)) if brightness_buffer else brightness
+
+def reset_buffers():
+    max_y_buffer.clear()
+    brightness_buffer.clear()
+
+
+# ============================================================
+#  한글 폰트
+# ============================================================
+
+def get_korean_font(size=20):
+    font_paths = [
+        "C:/Windows/Fonts/malgun.ttf",
+        "C:/Windows/Fonts/gulim.ttc",
+        "C:/Windows/Fonts/batang.ttc",
+        "C:/Windows/Fonts/NanumGothic.ttf",
+    ]
+    for fp in font_paths:
+        if os.path.exists(fp):
+            return ImageFont.truetype(fp, size)
+    return ImageFont.load_default()
+
+FONT_LARGE = get_korean_font(24)
+FONT_MEDIUM = get_korean_font(18)
+FONT_SMALL = get_korean_font(14)
+
+def put_korean_text(img, text, pos, font=None, color=(255, 255, 255)):
+    if font is None:
+        font = FONT_MEDIUM
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    rgb_color = (color[2], color[1], color[0])
+    draw.text(pos, text, font=font, fill=rgb_color)
+    result = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    np.copyto(img, result)
+
+
+# ============================================================
+#  ROI
+# ============================================================
+
+drawing = False
+start_point = None
+end_point = None
+roi_rect = None
+
+def mouse_callback(event, x, y, flags, param):
+    global drawing, start_point, end_point, roi_rect
+    if event == cv2.EVENT_LBUTTONDOWN:
+        drawing = True
+        start_point = (x, y)
+    elif event == cv2.EVENT_MOUSEMOVE and drawing:
+        end_point = (x, y)
+    elif event == cv2.EVENT_LBUTTONUP:
+        drawing = False
+        end_point = (x, y)
+        x1, y1 = min(start_point[0], end_point[0]), min(start_point[1], end_point[1])
+        x2, y2 = max(start_point[0], end_point[0]), max(start_point[1], end_point[1])
+        roi_rect = (x1, y1, x2, y2)
+
+def save_roi(roi):
+    with open(ROI_FILE, 'w') as f:
+        json.dump({'roi': roi}, f)
+
+def load_roi():
+    if os.path.exists(ROI_FILE):
+        with open(ROI_FILE, 'r') as f:
+            return tuple(json.load(f)['roi'])
+    return None
+
+
+# ============================================================
+#  카메라
+# ============================================================
+
+def init_camera():
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        print("카메라 연결 실패!")
+        return None
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"카메라 연결됨 ({w}x{h})")
+    return cap
+
+def read_frame(cap):
+    if not ANTI_FLICKER:
+        ret, frame = cap.read()
+        return ret, frame
+    frames = []
+    for _ in range(FRAME_AVG_COUNT):
+        ret, frame = cap.read()
+        if ret:
+            frames.append(frame.astype(np.float32))
+    if not frames:
+        return False, None
+    return True, np.mean(frames, axis=0).astype(np.uint8)
+
+
+# ============================================================
+#  직선 분석
+# ============================================================
+
+def get_line_angle(line):
+    x1, y1, x2, y2 = line[0]
+    dx = x2 - x1
+    dy = y2 - y1
+    angle = np.degrees(np.arctan2(dy, dx))
+    if angle > 90:
+        angle -= 180
+    elif angle < -90:
+        angle += 180
+    return angle
+
+def get_line_max_y(line):
+    x1, y1, x2, y2 = line[0]
+    return max(y1, y2)
+
+def classify_lines(lines, roi_height):
+    if lines is None or len(lines) == 0:
+        return None, None, 0
+    
+    pattern_lines = []
+    other_lines = []
+    pattern_max_y = 0
+    
+    for line in lines:
+        angle = get_line_angle(line)
+        deviation = abs(angle - BASELINE_ANGLE)
+        max_y = get_line_max_y(line)
+        
+        if deviation <= PATTERN_ANGLE_TOLERANCE:
+            pattern_lines.append(line)
+            if max_y > pattern_max_y:
+                pattern_max_y = max_y
+        else:
+            other_lines.append(line)
+    
+    pattern_arr = np.array(pattern_lines) if pattern_lines else None
+    other_arr = np.array(other_lines) if other_lines else None
+    
+    return pattern_arr, other_arr, pattern_max_y
+
+
+# ============================================================
+#  핵심 분석
+# ============================================================
+
+def analyze_pattern(gray):
+    h, w = gray.shape
+    
+    # 밝기 측정 (CNT 감지용)
+    brightness = float(gray.mean())
+    smoothed_brightness = get_smoothed_brightness(brightness)
+    
+    if ROI_MARGIN > 0 and h > ROI_MARGIN * 2 and w > ROI_MARGIN * 2:
+        gray = gray[ROI_MARGIN:h-ROI_MARGIN, ROI_MARGIN:w-ROI_MARGIN]
+        h, w = gray.shape
+    
+    roi_height = h
+    
+    if BLUR_KERNEL > 0:
+        gray_proc = cv2.GaussianBlur(gray, (BLUR_KERNEL, BLUR_KERNEL), 0)
+    else:
+        gray_proc = gray
+    
+    edges = cv2.Canny(gray_proc, CANNY_LOW, CANNY_HIGH)
+    lines_raw = cv2.HoughLinesP(edges, 1, np.pi / 180,
+                                threshold=HOUGH_THRESHOLD,
+                                minLineLength=MIN_LINE_LENGTH,
+                                maxLineGap=MAX_LINE_GAP)
+    
+    if lines_raw is None or len(lines_raw) == 0:
+        return {
+            'absorbed': False,
+            'pattern_count': 0,
+            'pattern_max_y': 0,
+            'smoothed_max_y': get_smoothed_max_y(0),
+            'roi_height': roi_height,
+            'distance_to_bottom': roi_height,
+            'reach_ratio': 0.0,
+            'pattern_lines': None,
+            'other_lines': None,
+            'angle_mean': 0.0,
+            'brightness': brightness,
+            'smoothed_brightness': smoothed_brightness,
+        }
+    
+    pattern_lines, other_lines, pattern_max_y = classify_lines(lines_raw, roi_height)
+    
+    if pattern_lines is not None and len(pattern_lines) > 0:
+        angles = [get_line_angle(line) for line in pattern_lines]
+        angle_mean = float(np.mean(angles))
+        pattern_count = len(pattern_lines)
+    else:
+        angle_mean = 0.0
+        pattern_count = 0
+        pattern_max_y = 0
+    
+    smoothed_max_y = get_smoothed_max_y(pattern_max_y)
+    distance_to_bottom = roi_height - smoothed_max_y
+    reach_ratio = smoothed_max_y / roi_height if roi_height > 0 else 0
+    absorbed = distance_to_bottom <= BOTTOM_MARGIN_PX
+    
+    return {
+        'absorbed': absorbed,
+        'pattern_count': pattern_count,
+        'pattern_max_y': pattern_max_y,
+        'smoothed_max_y': smoothed_max_y,
+        'roi_height': roi_height,
+        'distance_to_bottom': distance_to_bottom,
+        'reach_ratio': reach_ratio,
+        'pattern_lines': pattern_lines,
+        'other_lines': other_lines,
+        'angle_mean': angle_mean,
+        'brightness': brightness,
+        'smoothed_brightness': smoothed_brightness,
+    }
+
+
+def detect_liquid_type(m):
+    """
+    용액 타입 판별
+    
+    반환:
+      'empty' - 빈 상태 (패턴 바닥 도달)
+      'transparent' - 투명 용액 (패턴 보임 + reach_ratio 낮음)
+      'cnt' - CNT 용액 (패턴 안 보임 or 밝기 낮음)
+    """
+    # 흡수 완료 (패턴 바닥 도달)
+    if m['absorbed']:
+        return 'empty'
+    
+    # CNT 판별: 패턴 안 보이거나 밝기 낮음
+    if m['pattern_count'] < CNT_MIN_PATTERN_COUNT or m['smoothed_brightness'] < CNT_BRIGHTNESS_THRESHOLD:
+        return 'cnt'
+    
+    # 투명 용액: 패턴 보이지만 reach_ratio 낮음
+    if m['reach_ratio'] < LIQUID_REACH_THRESHOLD:
+        return 'transparent'
+    
+    # 그 외는 빈 상태로 간주
+    return 'empty'
+
+
+def beep_alert():
+    try:
+        winsound.Beep(1000, 500)
+    except:
+        print("\a")
+
+
+# ============================================================
+#  그리기
+# ============================================================
+
+def draw_lines(display, m, roi):
+    x1_roi, y1_roi, x2_roi, y2_roi = roi
+    offset_x = x1_roi + ROI_MARGIN
+    offset_y = y1_roi + ROI_MARGIN
+    
+    if m['pattern_lines'] is not None:
+        for line in m['pattern_lines']:
+            lx1, ly1, lx2, ly2 = line[0]
+            cv2.line(display, 
+                     (offset_x + lx1, offset_y + ly1), 
+                     (offset_x + lx2, offset_y + ly2), 
+                     (0, 255, 0), 2)
+    
+    if m['other_lines'] is not None:
+        for line in m['other_lines']:
+            lx1, ly1, lx2, ly2 = line[0]
+            cv2.line(display, 
+                     (offset_x + lx1, offset_y + ly1), 
+                     (offset_x + lx2, offset_y + ly2), 
+                     (128, 128, 128), 1)
+
+def draw_reach_bar(display, reach_ratio, absorbed, x, y, width=150, height=20):
+    cv2.rectangle(display, (x, y), (x + width, y + height), (50, 50, 50), -1)
+    
+    if absorbed:
+        color = (0, 255, 0)
+    elif reach_ratio >= 0.7:
+        color = (0, 255, 255)
+    else:
+        color = (0, 165, 255)
+    
+    fill_width = int(width * min(reach_ratio, 1.0))
+    if fill_width > 0:
+        cv2.rectangle(display, (x, y), (x + fill_width, y + height), color, -1)
+    
+    cv2.rectangle(display, (x, y), (x + width, y + height), (200, 200, 200), 1)
+
+
+# ============================================================
+#  메뉴들
+# ============================================================
+
+def select_roi():
+    global roi_rect
+    print("\nROI 설정 | Enter=확정 | R=리셋 | Q=취소")
+    
+    cap = init_camera()
+    if not cap:
+        return
+    
+    cv2.namedWindow("Select ROI")
+    cv2.setMouseCallback("Select ROI", mouse_callback)
+    roi_rect = None
+    reset_buffers()
+    load_baseline()
+    
+    while True:
+        ret, frame = read_frame(cap)
+        if not ret:
+            break
+        
+        display = frame.copy()
+        
+        if drawing and start_point and end_point:
+            cv2.rectangle(display, start_point, end_point, (0, 255, 0), 2)
+        
+        if roi_rect:
+            x1, y1, x2, y2 = roi_rect
+            roi_frame = frame[y1:y2, x1:x2]
+            gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+            m = analyze_pattern(gray)
+            liquid_type = detect_liquid_type(m)
+            
+            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            draw_lines(display, m, roi_rect)
+            
+            type_text = {'empty': '빈상태', 'transparent': '투명용액', 'cnt': 'CNT'}[liquid_type]
+            put_korean_text(display, f"{type_text} | 도달:{m['reach_ratio']*100:.0f}% | 밝기:{m['smoothed_brightness']:.0f}", 
+                           (x1, y1 - 25), FONT_SMALL, (0, 255, 255))
+        
+        cv2.imshow("Select ROI", display)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == 13 and roi_rect:
+            save_roi(roi_rect)
+            print(f"ROI 저장됨: {roi_rect}")
+            break
+        elif key == ord('r'):
+            roi_rect = None
+            reset_buffers()
+        elif key == ord('q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def live_view():
+    print("\n실시간 영상 | Q=종료")
+    
+    cap = init_camera()
+    if not cap:
+        return
+    
+    roi = load_roi()
+    load_baseline()
+    reset_buffers()
+    
+    while True:
+        ret, frame = read_frame(cap)
+        if not ret:
+            break
+        
+        display = frame.copy()
+        
+        if roi:
+            x1, y1, x2, y2 = roi
+            roi_frame = frame[y1:y2, x1:x2]
+            gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+            
+            m = analyze_pattern(gray)
+            liquid_type = detect_liquid_type(m)
+            
+            # 색상
+            if liquid_type == 'empty':
+                color = (0, 255, 0)     # 초록
+                status = "빈 상태 (흡수 완료)"
+            elif liquid_type == 'transparent':
+                color = (0, 255, 255)   # 노랑
+                status = "투명 용액"
+            else:
+                color = (0, 0, 255)     # 빨강
+                status = "CNT 용액"
+            
+            cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+            draw_lines(display, m, roi)
+            
+            put_korean_text(display, status, (10, 10), FONT_LARGE, color)
+            put_korean_text(display, f"도달: {m['reach_ratio']*100:.0f}%", (10, 50), FONT_MEDIUM, (255, 255, 0))
+            draw_reach_bar(display, m['reach_ratio'], m['absorbed'], 10, 80, 150, 15)
+            put_korean_text(display, f"패턴: {m['pattern_count']}개 | 밝기: {m['smoothed_brightness']:.0f}",
+                           (10, 105), FONT_SMALL, (150, 150, 150))
+        
+        cv2.imshow("Live View", display)
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def calibrate():
+    global BASELINE_ANGLE, CNT_BRIGHTNESS_THRESHOLD
+    
+    print("\n캘리브레이션")
+    print("  [B] 기준 각도 설정 (빈 상태에서)")
+    print("  [C] CNT 밝기 측정")
+    print("  [Q] 종료")
+    
+    roi = load_roi()
+    if not roi:
+        print("ROI 없음!")
+        return
+    
+    cap = init_camera()
+    if not cap:
+        return
+    
+    load_baseline()
+    x1, y1, x2, y2 = roi
+    reset_buffers()
+    
+    measured_values = {}
+    
+    while True:
+        ret, frame = read_frame(cap)
+        if not ret:
+            break
+        
+        roi_frame = frame[y1:y2, x1:x2]
+        gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+        m = analyze_pattern(gray)
+        liquid_type = detect_liquid_type(m)
+        
+        # 색상
+        if liquid_type == 'empty':
+            color = (0, 255, 0)
+        elif liquid_type == 'transparent':
+            color = (0, 255, 255)
+        else:
+            color = (0, 0, 255)
+        
+        display = frame.copy()
+        cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+        draw_lines(display, m, roi)
+        
+        type_text = {'empty': '빈상태', 'transparent': '투명용액', 'cnt': 'CNT'}[liquid_type]
+        put_korean_text(display, f"{type_text}", (10, 10), FONT_LARGE, color)
+        put_korean_text(display, f"도달:{m['reach_ratio']*100:.0f}% | 기준각:{BASELINE_ANGLE:.1f}°",
+                        (10, 50), FONT_MEDIUM, (255, 255, 0))
+        put_korean_text(display, f"패턴:{m['pattern_count']}개 | 밝기:{m['smoothed_brightness']:.0f} (T={CNT_BRIGHTNESS_THRESHOLD})",
+                        (10, 85), FONT_SMALL, (200, 200, 200))
+        
+        # 측정값 표시
+        y_pos = 120
+        for k, v in measured_values.items():
+            put_korean_text(display, f"[{k}] {v}", (10, y_pos), FONT_SMALL, (255, 255, 255))
+            y_pos += 25
+        
+        put_korean_text(display, "[B]기준각도 [C]CNT밝기 [Q]종료", (10, y_pos + 10), FONT_SMALL, (150, 150, 150))
+        
+        cv2.imshow("Calibration", display)
+        
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('b') or key == ord('B'):
+            if m['pattern_count'] >= 2:
+                BASELINE_ANGLE = m['angle_mean']
+                save_baseline(BASELINE_ANGLE)
+                reset_buffers()
+                measured_values['B'] = f"기준각도: {BASELINE_ANGLE:.1f}°"
+                print(f"\n★ 기준 각도 설정: {BASELINE_ANGLE:.1f}°")
+        
+        elif key == ord('c') or key == ord('C'):
+            measured_values['C'] = f"CNT 밝기: {m['smoothed_brightness']:.0f}"
+            print(f"\n★ CNT 밝기 측정: {m['smoothed_brightness']:.0f}")
+            print(f"   추천 CNT_BRIGHTNESS_THRESHOLD: {m['smoothed_brightness'] + 20:.0f}")
+        
+        elif key == ord('q') or key == ord('Q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def full_cycle_test():
+    print("\n" + "="*50)
+    print("  전체 사이클 테스트 (4상태)")
+    print("="*50)
+    print("""
+  [흐름]
+    1. 투명 넣기 대기 → 패턴 굴절 감지 → 확인!
+    2. 투명 흡수 대기 → 패턴 바닥 도달 → 완료!
+    3. CNT 넣기 대기  → 패턴 안 보임  → 확인!
+    4. CNT 흡수 대기  → 패턴 바닥 도달 → 완료! → 1번으로
+    
+  [Q] = 종료
+""")
+    
+    roi = load_roi()
+    if not roi:
+        print("ROI 없음!")
+        return
+    
+    cap = init_camera()
+    if not cap:
+        return
+    
+    load_baseline()
+    x1, y1, x2, y2 = roi
+    reset_buffers()
+    
+    state = 'wait_transparent_add'
+    stable_counter = 0
+    cycle_count = 0
+    
+    print("\n시작! 투명 용액을 넣으세요...")
+    
+    while True:
+        ret, frame = read_frame(cap)
+        if not ret:
+            break
+        
+        roi_frame = frame[y1:y2, x1:x2]
+        gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+        m = analyze_pattern(gray)
+        liquid_type = detect_liquid_type(m)
+        
+        display = frame.copy()
+        draw_lines(display, m, roi)
+        
+        # ============================================
+        # 상태 1: 투명 용액 넣기 대기
+        # 투명 용액 = 패턴 보이지만 reach_ratio 낮음
+        # ============================================
+        if state == 'wait_transparent_add':
+            if liquid_type == 'transparent':
+                stable_counter += 1
+            else:
+                stable_counter = 0
+            
+            if stable_counter >= STABLE_COUNT:
+                beep_alert()
+                print(f"\n투명 용액 확인! (도달:{m['reach_ratio']*100:.0f}%)")
+                state = 'wait_transparent_absorb'
+                stable_counter = 0
+            
+            status = f"[투명 넣기 대기]"
+            color = (255, 255, 0)
+            instruction = ">>> 투명 용액을 넣으세요! <<<"
+        
+        # ============================================
+        # 상태 2: 투명 용액 흡수 대기
+        # 흡수 완료 = 패턴이 바닥에 닿음
+        # ============================================
+        elif state == 'wait_transparent_absorb':
+            if m['absorbed']:
+                stable_counter += 1
+            else:
+                stable_counter = 0
+            
+            if stable_counter >= STABLE_COUNT:
+                beep_alert()
+                print(f"\n투명 용액 흡수 완료! (도달:{m['reach_ratio']*100:.0f}%)")
+                state = 'wait_cnt_add'
+                stable_counter = 0
+            
+            status = f"[투명 흡수 중]"
+            color = (0, 255, 255)
+            instruction = "투명 용액 흡수 중..."
+        
+        # ============================================
+        # 상태 3: CNT 넣기 대기
+        # CNT = 패턴 안 보임 or 밝기 낮음
+        # ============================================
+        elif state == 'wait_cnt_add':
+            if liquid_type == 'cnt':
+                stable_counter += 1
+            else:
+                stable_counter = 0
+            
+            if stable_counter >= STABLE_COUNT:
+                beep_alert()
+                print(f"\nCNT 확인! (패턴:{m['pattern_count']}개, 밝기:{m['smoothed_brightness']:.0f})")
+                state = 'wait_cnt_absorb'
+                stable_counter = 0
+            
+            status = f"[CNT 넣기 대기]"
+            color = (0, 165, 255)
+            instruction = ">>> CNT를 넣으세요! <<<"
+        
+        # ============================================
+        # 상태 4: CNT 흡수 대기
+        # 흡수 완료 = 패턴이 바닥에 닿음
+        # ============================================
+        elif state == 'wait_cnt_absorb':
+            if m['absorbed']:
+                stable_counter += 1
+            else:
+                stable_counter = 0
+            
+            if stable_counter >= STABLE_COUNT:
+                beep_alert()
+                print(f"\nCNT 흡수 완료! (도달:{m['reach_ratio']*100:.0f}%)")
+                state = 'wait_transparent_add'
+                stable_counter = 0
+                cycle_count += 1
+                print(f"\n>>> 사이클 {cycle_count} 완료! 투명 용액을 넣으세요...")
+            
+            status = f"[CNT 흡수 중]"
+            color = (0, 0, 255)
+            instruction = "CNT 흡수 중..."
+        
+        # 화면 표시
+        cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+        
+        put_korean_text(display, status, (10, 10), FONT_LARGE, color)
+        put_korean_text(display, instruction, (10, 50), FONT_MEDIUM, (255, 255, 255))
+        put_korean_text(display, f"사이클: {cycle_count} | 안정: {stable_counter}/{STABLE_COUNT}",
+                        (10, 85), FONT_SMALL, (200, 200, 200))
+        
+        put_korean_text(display, f"도달: {m['reach_ratio']*100:.0f}%", (10, 120), FONT_MEDIUM, (255, 255, 0))
+        draw_reach_bar(display, m['reach_ratio'], m['absorbed'], 10, 150, 200, 20)
+        
+        type_text = {'empty': '빈상태', 'transparent': '투명용액', 'cnt': 'CNT'}[liquid_type]
+        put_korean_text(display, f"감지: {type_text} | 패턴:{m['pattern_count']} | 밝기:{m['smoothed_brightness']:.0f}",
+                        (10, 180), FONT_SMALL, (150, 150, 150))
+        
+        cv2.imshow("Full Cycle Test", display)
+        
+        if cv2.waitKey(int(CHECK_INTERVAL * 1000)) & 0xFF == ord('q'):
+            break
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    print(f"\n종료! 총 {cycle_count} 사이클 완료")
+
+
+# ============================================================
+#  메인
+# ============================================================
+
+def main():
+    load_baseline()
+    
+    while True:
+        print("\n" + "=" * 50)
+        print("  CNT 분리 자동화 v11 (투명/CNT 4상태)")
+        print("=" * 50)
+        
+        roi = load_roi()
+        print(f"  ROI: {roi if roi else '없음'}")
+        print(f"  기준 각도: {BASELINE_ANGLE:.1f}°")
+        print(f"  CNT 밝기 threshold: {CNT_BRIGHTNESS_THRESHOLD}")
+        
+        print("""
+  [설정]
+    1. ROI 설정
+    2. 실시간 영상
+    3. 캘리브레이션
+    
+  [테스트]
+    6. 전체 사이클 테스트
+
+    q. 종료
+""")
+        
+        choice = input("선택 >> ").strip().lower()
+        
+        if choice == '1':
+            select_roi()
+        elif choice == '2':
+            live_view()
+        elif choice == '3':
+            calibrate()
+        elif choice == '6':
+            full_cycle_test()
+        elif choice == 'q':
+            print("종료")
+            break
+
+
+if __name__ == "__main__":
+    main()
