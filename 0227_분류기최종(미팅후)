@@ -1,0 +1,280 @@
+"""
+CNT UV-Vis 4-Class Classifier (0.13 mL/min 전용)
+=================================================
+Metal / Mix / Semiconductor / TRASH 분류
+
+Features:
+  [1] norm_slope   : 800-950nm 기울기/평균 (평탄도)
+  [2] metal_bump   : 700nm / avg(600, 750nm) (금속 bump)
+  [3] rise_ratio   : 970nm / 850nm (상승 정도) ← 연구원님 기준 반영
+  [4] semi_peak    : 1000nm / 950nm (반도체 S11 피크)
+
+Classification Logic:
+  1. max_abs < 0.0025       → TRASH (노이즈)
+  2. Semi 3조건 AND         → Semi  (rr>1.369, slope>0.0002, sp>0.93)
+  3. Metal 3조건 AND        → Metal (rr<1.04, slope<0.0002, bump>1.04)
+  4. 1.04 ≤ rr ≤ 1.369      → Mix   (전이구간)
+  5. 나머지                  → TRASH
+
+Spike Protection:
+  _abs_at()은 단일 포인트가 ±2nm median 대비 30% 이상 벗어나면 median 사용.
+  정상 스펙트럼에서는 single point와 동일하게 동작.
+
+Performance (cnt_0204, 121 labeled):
+  3-class 기준: 100% (121/121) — Metal 44, Semi 21, TRASH 56
+  4-class 적용: Metal 44, Mix 41 (#60~#100), Semi 21, TRASH 15
+"""
+
+import numpy as np
+from pathlib import Path
+
+
+# ============================================================
+# Thresholds (grid search optimized on 0.13 data, 970nm)
+# ============================================================
+PARAMS = {
+    "slope_th": 0.0002,       # norm_slope 경계
+    "bump_th": 1.04,          # metal_bump 최소
+    "metal_rise_max": 1.04,   # rise_ratio Metal 최대
+    "semi_rise_min": 1.369,   # rise_ratio Semi 최소 (#101 rr=1.3696 보존)
+    "semi_peak_min": 0.93,    # semi_peak 최소
+    "min_abs": 0.0025,        # 노이즈 기준 (Metal #16 max_abs=0.003 보존 + 가짜Semi max=0.0017 차단)
+}
+
+
+# ============================================================
+# JASCO CSV Parser
+# ============================================================
+def parse_jasco_csv(filepath):
+    """JASCO V-770 CSV 파일 파싱 → (wavelengths, absorbances, metadata)"""
+    filepath = Path(filepath)
+    metadata, wavelengths, absorbances = {}, [], []
+    in_data = False
+
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if line == "XYDATA":
+                in_data = True
+                continue
+            if in_data:
+                if line.startswith("#") or line == "":
+                    if line.startswith("#"):
+                        break
+                    continue
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    try:
+                        wavelengths.append(float(parts[0]))
+                        absorbances.append(float(parts[1]))
+                    except ValueError:
+                        break
+            else:
+                parts = line.split(",", 1)
+                if len(parts) == 2:
+                    metadata[parts[0].strip()] = parts[1].strip()
+
+    wl = np.array(wavelengths)
+    ab = np.array(absorbances)
+    if len(wl) > 1 and wl[0] > wl[-1]:
+        wl, ab = wl[::-1], ab[::-1]
+    return wl, ab, metadata
+
+
+# ============================================================
+# Feature Extraction (spike-safe)
+# ============================================================
+def _abs_at(wl, ab, target, spike_threshold=0.3):
+    """
+    특정 파장의 흡광도 (스파이크 보정).
+    단일 포인트가 ±2nm median 대비 30% 이상 벗어나면 median 사용.
+    정상 스펙트럼에서는 single point와 동일하게 동작.
+    """
+    idx = np.argmin(np.abs(wl - target))
+    val = float(ab[idx])
+    mask = (wl >= target - 2) & (wl <= target + 2)
+    neighbors = ab[mask]
+    if len(neighbors) < 3:
+        return val
+    med = float(np.median(neighbors))
+    if abs(val - med) > spike_threshold * abs(med + 1e-10):
+        return med  # 스파이크 → median 사용
+    return val      # 정상 → single point 유지
+
+
+def extract_features(wl, ab):
+    """UV-Vis 스펙트럼에서 4개 feature 추출"""
+    features = {}
+    features["max_abs"] = float(np.max(ab))
+
+    # [1] norm_slope: 800-950nm 직선 기울기 / 평균흡광도
+    mask = (wl >= 800) & (wl <= 950)
+    wl_r, ab_r = wl[mask], ab[mask]
+    if len(wl_r) >= 5:
+        slope = np.polyfit(wl_r, ab_r, 1)[0]
+        features["norm_slope"] = slope / (np.mean(ab_r) + 1e-10)
+    else:
+        features["norm_slope"] = 0.0
+
+    # [2] metal_bump: 700nm / avg(600nm, 750nm)
+    a600 = _abs_at(wl, ab, 600)
+    a700 = _abs_at(wl, ab, 700)
+    a750 = _abs_at(wl, ab, 750)
+    features["metal_bump"] = a700 / ((a600 + a750) / 2 + 1e-10)
+
+    # [3] rise_ratio: 970nm / 850nm (연구원님 기준)
+    a850 = _abs_at(wl, ab, 850)
+    a970 = _abs_at(wl, ab, 970)
+    features["rise_ratio"] = a970 / (a850 + 1e-10)
+
+    # [4] semi_peak: 1000nm / 950nm
+    a950 = _abs_at(wl, ab, 950)
+    a1000 = _abs_at(wl, ab, 1000)
+    features["semi_peak"] = a1000 / (a950 + 1e-10)
+
+    return features
+
+
+# ============================================================
+# Classifier
+# ============================================================
+def classify(features, params=None):
+    """
+    4-class 분류: Metal / Mix / Semi / TRASH
+
+    Args:
+        features: extract_features()의 반환값
+        params: threshold dict (기본값: PARAMS)
+
+    Returns:
+        "Metal", "Semi", "Mix", or "TRASH"
+    """
+    P = params or PARAMS
+    f = features
+
+    # Step 1: 노이즈 제거
+    if f["max_abs"] < P["min_abs"]:
+        return "TRASH"
+
+    # Step 2: Semi 판정 (3조건 AND)
+    if (f["norm_slope"] > P["slope_th"]
+        and f["rise_ratio"] > P["semi_rise_min"]
+        and f["semi_peak"] > P["semi_peak_min"]):
+        return "Semi"
+
+    # Step 3: Metal 판정 (3조건 AND)
+    if (f["norm_slope"] < P["slope_th"]
+        and f["metal_bump"] > P["bump_th"]
+        and f["rise_ratio"] < P["metal_rise_max"]):
+        return "Metal"
+
+    # Step 4: Mix 판정 (전이구간 — Metal 이후, Semi 이전)
+    if (f["rise_ratio"] >= P["metal_rise_max"]
+        and f["rise_ratio"] <= P["semi_rise_min"]):
+        return "Mix"
+
+    # Step 5: 나머지 = TRASH
+    return "TRASH"
+
+
+def classify_file(filepath, params=None):
+    """CSV 파일 → 분류 결과"""
+    wl, ab, meta = parse_jasco_csv(filepath)
+    if len(wl) < 50:
+        return "TRASH", {}, meta
+    features = extract_features(wl, ab)
+    result = classify(features, params)
+    return result, features, meta
+
+
+# ============================================================
+# Batch Classification
+# ============================================================
+def classify_directory(directory, params=None):
+    """
+    디렉토리 내 모든 CSV 파일 분류
+
+    Returns:
+        list of dict: [{frac, result, features}, ...]
+    """
+    import re
+    directory = Path(directory)
+    csv_files = sorted(
+        directory.glob("*.csv"),
+        key=lambda f: int(re.search(r"-(\d+)\.csv", f.name).group(1))
+        if re.search(r"-(\d+)\.csv", f.name) else 0
+    )
+
+    results = []
+    for csv_f in csv_files:
+        m = re.search(r"-(\d+)\.csv", csv_f.name)
+        frac = int(m.group(1)) if m else 0
+        result, features, _ = classify_file(csv_f, params)
+        results.append({
+            "frac": frac,
+            "result": result,
+            "features": features,
+            "file": str(csv_f),
+        })
+
+    return results
+
+
+def print_summary(results):
+    """분류 결과 요약 출력"""
+    from collections import Counter
+    counts = Counter(r["result"] for r in results)
+    total = len(results)
+
+    print(f"\n{'='*50}")
+    print(f"Classification Summary ({total} fractions)")
+    print(f"{'='*50}")
+    print(f"  Metal: {counts.get('Metal', 0):4d} ({counts.get('Metal', 0)/total*100:.1f}%)")
+    print(f"  Mix:   {counts.get('Mix', 0):4d} ({counts.get('Mix', 0)/total*100:.1f}%)")
+    print(f"  Semi:  {counts.get('Semi', 0):4d} ({counts.get('Semi', 0)/total*100:.1f}%)")
+    print(f"  TRASH: {counts.get('TRASH', 0):4d} ({counts.get('TRASH', 0)/total*100:.1f}%)")
+
+    for label in ["Metal", "Mix", "Semi"]:
+        fracs = sorted([r["frac"] for r in results if r["result"] == label])
+        if fracs:
+            blocks = []
+            s = fracs[0]
+            p = fracs[0]
+            for f in fracs[1:]:
+                if f != p + 1:
+                    blocks.append(f"#{s}~#{p}" if s != p else f"#{s}")
+                    s = f
+                p = f
+            blocks.append(f"#{s}~#{p}" if s != p else f"#{s}")
+            print(f"  {label} fractions: {', '.join(blocks)}")
+
+
+# ============================================================
+# Main
+# ============================================================
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python cnt_classifier_013.py <csv_file_or_directory>")
+        print("  Single file:  python cnt_classifier_013.py fraction-42.csv")
+        print("  Directory:    python cnt_classifier_013.py ./UV_Vis_data/")
+        sys.exit(1)
+
+    target = Path(sys.argv[1])
+
+    if target.is_file():
+        result, features, _ = classify_file(target)
+        print(f"\nFile: {target.name}")
+        print(f"Result: {result}")
+        print(f"Features:")
+        for k, v in features.items():
+            print(f"  {k}: {v:.5f}")
+
+    elif target.is_dir():
+        results = classify_directory(target)
+        print_summary(results)
+
+    else:
+        print(f"Error: {target} not found")
+        sys.exit(1)
